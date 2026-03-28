@@ -46,14 +46,3 @@ resource apimOaiApiPassthrough 'Microsoft.ApiManagement/service/apis/operations@
   }
 }]
 
-resource apimOaiApiPolicy 'Microsoft.ApiManagement/service/apis/policies@2021-08-01' = {
-  parent: apimOaiApi
-  name: 'policy'
-  dependsOn: [
-    openAiBackend
-  ]
-  properties: {
-    format: 'rawxml'
-    value: loadTextContent('../../policies/entra-jwt-policy.xml')
-  }
-}

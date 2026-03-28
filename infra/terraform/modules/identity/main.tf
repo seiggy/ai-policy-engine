@@ -8,10 +8,7 @@ data "azuread_client_config" "current" {}
 resource "random_uuid" "oauth2_scope_id" {}
 resource "random_uuid" "gateway_scope_id" {}
 
-# Placeholder UUIDs for identifier_uris (replaced by local-exec after creation
-# because the real value is api://{client_id} which isn't known until apply time)
-resource "random_uuid" "gateway_app_placeholder" {}
-resource "random_uuid" "api_app_placeholder" {}
+
 
 # Random UUIDs for app role IDs
 resource "random_uuid" "role_export" {}
@@ -26,7 +23,6 @@ resource "random_uuid" "role_apim" {}
 resource "azuread_application" "gateway" {
   display_name     = "Chargeback APIM Gateway"
   sign_in_audience = "AzureADMultipleOrgs"
-  identifier_uris  = ["api://${random_uuid.gateway_app_placeholder.result}"]
 
   api {
     oauth2_permission_scope {
@@ -78,7 +74,6 @@ resource "azuread_service_principal" "gateway" {
 resource "azuread_application" "api" {
   display_name     = "Chargeback API"
   sign_in_audience = "AzureADMyOrg"
-  identifier_uris  = ["api://${random_uuid.api_app_placeholder.result}"]
 
   api {
     oauth2_permission_scope {
