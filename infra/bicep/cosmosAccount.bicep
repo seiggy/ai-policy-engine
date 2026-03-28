@@ -12,6 +12,7 @@ resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2024-05-15' = {
     type: 'SystemAssigned'
   }
   properties: {
+    disableLocalAuth: false
     databaseAccountOfferType: 'Standard'
     capabilities: [
       {
@@ -28,6 +29,9 @@ resource cosmosAccount 'Microsoft.DocumentDB/databaseAccounts@2024-05-15' = {
         isZoneRedundant: false
       }
     ]
+  }
+  tags: {
+    SecurityControl: 'ignore'
   }
 }
 

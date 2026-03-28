@@ -75,7 +75,6 @@ resource "azurerm_cosmosdb_account" "this" {
   resource_group_name = var.resource_group_name
   offer_type          = "Standard"
   kind                = "GlobalDocumentDB"
-  tags                = var.tags
 
   capabilities {
     name = "EnableServerless"
@@ -93,6 +92,12 @@ resource "azurerm_cosmosdb_account" "this" {
   identity {
     type = "SystemAssigned"
   }
+
+  local_authentication_disabled = false
+
+  tags                = merge(var.tags, {
+    "SecurityControl" = "ignore"
+  })
 }
 
 resource "azurerm_cosmosdb_sql_database" "this" {

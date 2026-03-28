@@ -4,7 +4,7 @@
 param apimInstanceName string
 param location string
 
-resource apimInstance 'Microsoft.ApiManagement/service@2021-08-01' = {
+resource apimInstance 'Microsoft.ApiManagement/service@2024-06-01-preview' = {
   name: apimInstanceName
   location: location
   sku: {
