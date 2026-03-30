@@ -15,6 +15,8 @@
 #   -s, --secondary-tenant-id ID       Optional second Entra tenant for cross-tenant demo
 #       --skip-bicep                   Skip the Bicep deployment
 #       --skip-build                   Skip ACR image build
+#       --no-jwt                       Disable JWT-authenticated OpenAI API endpoint
+#       --no-keys                      Disable subscription-key-authenticated OpenAI API endpoint
 #   -h, --help                         Show this help
 
 set -uo pipefail
@@ -49,6 +51,8 @@ RESOURCE_GROUP_NAME=""
 SECONDARY_TENANT_ID=""
 SKIP_BICEP=false
 SKIP_BUILD=false
+ENABLE_JWT=true
+ENABLE_KEYS=true
 
 usage() {
     sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# //' | sed 's/^#//'
@@ -63,6 +67,8 @@ while [[ $# -gt 0 ]]; do
         -s|--secondary-tenant-id) SECONDARY_TENANT_ID="$2";  shift 2 ;;
         --skip-bicep)            SKIP_BICEP=true;             shift   ;;
         --skip-build)            SKIP_BUILD=true;             shift   ;;
+        --no-jwt)                ENABLE_JWT=false;            shift   ;;
+        --no-keys)               ENABLE_KEYS=false;           shift   ;;
         -h|--help)               usage ;;
         *) die "Unknown option: $1" ;;
     esac
@@ -743,6 +749,8 @@ else
             acrPassword="$acr_password" \
             oaiApiName="azure-openai-api" \
             funcApiName="chargeback-api" \
+            enableJwt="$ENABLE_JWT" \
+            enableKeys="$ENABLE_KEYS" \
         --query "properties.outputs" -o json --only-show-errors 2>&1) \
         || { echo -e "  ${RED}Bicep deployment error details:${NC}"; echo "$bicep_result" >&2; die "Bicep deployment failed."; }
 
@@ -920,33 +928,68 @@ az apim nv create --resource-group "$RESOURCE_GROUP_NAME" --service-name "$APIM_
 success "ContainerAppAudience = api://$api_app_id"
 
 info "Disabling subscription requirement on OpenAI API..."
-az apim api update --resource-group "$RESOURCE_GROUP_NAME" --service-name "$APIM_NAME" \
-    --api-id azure-openai-api --subscription-required false -o none \
-    || die "Failed to update API subscription setting."
-success "Subscription requirement disabled"
-
-info "Configuring API path and backend..."
-ai_endpoint=$(az cognitiveservices account list --resource-group "$RESOURCE_GROUP_NAME" \
-    --query "[?kind=='AIServices'].properties.endpoint | [0]" -o tsv 2>/dev/null) || true
-if [[ -n "$ai_endpoint" ]]; then
+if [[ "$ENABLE_JWT" == "true" ]]; then
     az apim api update --resource-group "$RESOURCE_GROUP_NAME" --service-name "$APIM_NAME" \
-        --api-id azure-openai-api --set path=openai --service-url "${ai_endpoint}openai" -o none || true
-    success "API path set to /openai, backend = ${ai_endpoint}openai"
+        --api-id azure-openai-api-jwt --subscription-required false -o none \
+        || die "Failed to update API subscription setting."
+    success "Subscription requirement disabled"
 else
-    warn "No AI endpoint found — skipping API path update"
+    info "JWT API disabled — skipping subscription requirement update"
 fi
 
-info "Uploading APIM JWT validation policy..."
-policy_xml=$(<"$REPO_ROOT/policies/entra-jwt-policy.xml")
-policy_body=$(jq -n --arg xml "$policy_xml" '{"properties":{"format":"rawxml","value":$xml}}')
-tmp_policy=$(mktemp)
-echo "$policy_body" > "$tmp_policy"
-policy_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$RESOURCE_GROUP_NAME/providers/Microsoft.ApiManagement/service/$APIM_NAME/apis/azure-openai-api/policies/policy?api-version=2022-08-01"
-az rest --method PUT --uri "$policy_uri" \
-    --headers "Content-Type=application/json" --body "@$tmp_policy" -o none \
-    || { rm -f "$tmp_policy"; die "Failed to upload APIM policy."; }
-rm -f "$tmp_policy"
-success "APIM policy uploaded (entra-jwt-policy.xml)"
+if [[ "$ENABLE_JWT" == "true" ]]; then
+    info "Configuring JWT-based API path and backend..."
+    ai_endpoint=$(az cognitiveservices account list --resource-group "$RESOURCE_GROUP_NAME" \
+        --query "[?kind=='AIServices'].properties.endpoint | [0]" -o tsv 2>/dev/null) || true
+    if [[ -n "$ai_endpoint" ]]; then
+        az apim api update --resource-group "$RESOURCE_GROUP_NAME" --service-name "$APIM_NAME" \
+            --api-id azure-openai-api-jwt --set path=jwt/openai --service-url "${ai_endpoint}openai" -o none || true
+        success "API path set to /jwt/openai, backend = ${ai_endpoint}openai"
+    else
+        warn "No AI endpoint found — skipping API path update"
+    fi
+
+    info "Uploading APIM JWT validation policy..."
+    policy_xml=$(<"$REPO_ROOT/policies/entra-jwt-policy.xml")
+    policy_body=$(jq -n --arg xml "$policy_xml" '{"properties":{"format":"rawxml","value":$xml}}')
+    tmp_policy=$(mktemp)
+    echo "$policy_body" > "$tmp_policy"
+    policy_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$RESOURCE_GROUP_NAME/providers/Microsoft.ApiManagement/service/$APIM_NAME/apis/azure-openai-api-jwt/policies/policy?api-version=2022-08-01"
+    az rest --method PUT --uri "$policy_uri" \
+        --headers "Content-Type=application/json" --body "@$tmp_policy" -o none \
+        || { rm -f "$tmp_policy"; die "Failed to upload APIM policy."; }
+    rm -f "$tmp_policy"
+    success "APIM policy uploaded (entra-jwt-policy.xml)"
+else
+    info "JWT API disabled — skipping JWT policy upload"
+fi
+
+if [[ "$ENABLE_KEYS" == "true" ]]; then
+    info "Configuring key-based API path and backend..."
+    ai_endpoint=$(az cognitiveservices account list --resource-group "$RESOURCE_GROUP_NAME" \
+        --query "[?kind=='AIServices'].properties.endpoint | [0]" -o tsv 2>/dev/null) || true
+    if [[ -n "$ai_endpoint" ]]; then
+        az apim api update --resource-group "$RESOURCE_GROUP_NAME" --service-name "$APIM_NAME" \
+            --api-id azure-openai-api-keys --set path=keys/openai --service-url "${ai_endpoint}openai" -o none || true
+        success "API path set to /keys/openai, backend = ${ai_endpoint}openai"
+    else
+        warn "No AI endpoint found — skipping API path update"
+    fi
+
+    info "Uploading APIM subscription-key policy..."
+    key_policy_xml=$(<"$REPO_ROOT/policies/subscription-key-policy.xml")
+    key_policy_body=$(jq -n --arg xml "$key_policy_xml" '{"properties":{"format":"rawxml","value":$xml}}')
+    tmp_key_policy=$(mktemp)
+    echo "$key_policy_body" > "$tmp_key_policy"
+    key_policy_uri="https://management.azure.com/subscriptions/$subscription_id/resourceGroups/$RESOURCE_GROUP_NAME/providers/Microsoft.ApiManagement/service/$APIM_NAME/apis/azure-openai-api-keys/policies/policy?api-version=2022-08-01"
+    az rest --method PUT --uri "$key_policy_uri" \
+        --headers "Content-Type=application/json" --body "@$tmp_key_policy" -o none \
+        || { rm -f "$tmp_key_policy"; die "Failed to upload subscription-key APIM policy."; }
+    rm -f "$tmp_key_policy"
+    success "APIM policy uploaded (subscription-key-policy.xml)"
+else
+    info "Key-based API disabled — skipping subscription-key policy upload"
+fi
 
 echo -e "  ${GREEN}Phase 7 complete ✓${NC}"
 echo ""
@@ -1147,21 +1190,24 @@ cat > "$demo_env_file" <<EOF
 DemoClient__TenantId=$tenant_id
 DemoClient__SecondaryTenantId=${SECONDARY_TENANT_ID}
 DemoClient__ApiScope=api://$api_app_id/.default
-DemoClient__ApimBase=https://${APIM_NAME}.azure-api.net
+DemoClient__ApimBase=https://${APIM_NAME}.azure-api.net/jwt
 DemoClient__ApiVersion=2024-02-01
 DemoClient__ChargebackBase=https://$container_app_url
-DemoClient__Clients__0__Name=Chargeback Sample Client
+DemoClient__Clients__0__Name="Chargeback Sample Client"
 DemoClient__Clients__0__AppId=$client1_app_id
 DemoClient__Clients__0__Secret=$client1_secret_env
 DemoClient__Clients__0__Plan=Enterprise
 DemoClient__Clients__0__DeploymentId=gpt-4o
 DemoClient__Clients__0__TenantId=$tenant_id
-DemoClient__Clients__1__Name=Chargeback Demo Client 2
+DemoClient__Clients__1__Name="Chargeback Demo Client 2"
 DemoClient__Clients__1__AppId=$client2_app_id
 DemoClient__Clients__1__Secret=$client2_secret_env
 DemoClient__Clients__1__Plan=Starter
 DemoClient__Clients__1__DeploymentId=gpt-4o-mini
 DemoClient__Clients__1__TenantId=$tenant_id
+DemoClient__AgentInstructions="You are a concise Azure platform assistant. Keep responses to one sentence."
+DemoClient__Prompts__0="What is Azure API Management in one sentence?"
+DemoClient__Prompts__1="Explain token-based billing in one sentence."
 EOF
 
 # Write deployment-output.json

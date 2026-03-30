@@ -16,6 +16,10 @@
     Skip the Bicep deployment (useful when re-running post-deploy steps)
 .PARAMETER SkipDocker
     Skip Docker build/push (useful when image is already in ACR)
+.PARAMETER EnableJwt
+    Deploy the JWT-authenticated OpenAI API endpoint (default: true). Use -EnableJwt:$false to disable.
+.PARAMETER EnableKeys
+    Deploy the subscription-key-authenticated OpenAI API endpoint (default: true). Use -EnableKeys:$false to disable.
 .PARAMETER SecondaryTenantId
     Optional second Entra tenant ID. When provided, Client 2 (multi-tenant) is also
     registered for billing under this tenant — useful for demonstrating per-tenant
@@ -31,7 +35,9 @@ param(
     [string]$ResourceGroupName = "",
     [string]$SecondaryTenantId = "",
     [switch]$SkipBicep,
-    [switch]$SkipDocker
+    [switch]$SkipDocker,
+    [bool]$EnableJwt = $true,
+    [bool]$EnableKeys = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -776,6 +782,10 @@ if ($SkipBicep) {
                 acrLoginServer="$($AcrName).azurecr.io" `
                 acrUsername=$AcrName `
                 acrPassword=$acrPassword `
+                oaiApiName="azure-openai-api" `
+                funcApiName="chargeback-api" `
+                enableJwt=$($EnableJwt.ToString().ToLower()) `
+                enableKeys=$($EnableKeys.ToString().ToLower()) `
             --query "properties.outputs" -o json --only-show-errors 2>&1
 
         if ($LASTEXITCODE -ne 0) {
@@ -984,37 +994,74 @@ try {
         --named-value-id ContainerAppAudience --display-name "ContainerAppAudience" --value "api://$apiAppId" -o none 2>$null
     Write-Host "    ✓ ContainerAppAudience = api://$apiAppId" -ForegroundColor Green
 
-    # Disable subscription required on the OpenAI API
-    Write-Host "  Disabling subscription requirement on OpenAI API..." -ForegroundColor Gray
-    az apim api update --resource-group $ResourceGroupName --service-name $ApimName `
-        --api-id azure-openai-api --subscription-required false -o none
-    if ($LASTEXITCODE -ne 0) { throw "Failed to update API subscription setting." }
-    Write-Host "    ✓ Subscription requirement disabled" -ForegroundColor Green
-
-    # Fix API path and backend service URL
-    Write-Host "  Configuring API path and backend..." -ForegroundColor Gray
-    $aiEndpoint = az cognitiveservices account list --resource-group $ResourceGroupName `
-        --query "[?kind=='AIServices'].properties.endpoint | [0]" -o tsv
-    if ($aiEndpoint) {
+    # Disable subscription required on the JWT OpenAI API
+    if ($EnableJwt) {
+        Write-Host "  Disabling subscription requirement on JWT OpenAI API..." -ForegroundColor Gray
         az apim api update --resource-group $ResourceGroupName --service-name $ApimName `
-            --api-id azure-openai-api --set path=openai --service-url "${aiEndpoint}openai" -o none
-        Write-Host "    ✓ API path set to /openai, backend = ${aiEndpoint}openai" -ForegroundColor Green
+            --api-id azure-openai-api-jwt --subscription-required false -o none
+        if ($LASTEXITCODE -ne 0) { throw "Failed to update API subscription setting." }
+        Write-Host "    ✓ Subscription requirement disabled" -ForegroundColor Green
     } else {
-        Write-Host "    ⚠ No AI endpoint found — skipping API path update" -ForegroundColor DarkYellow
+        Write-Host "    ⊘ JWT API disabled — skipping subscription requirement update" -ForegroundColor DarkGray
     }
 
-    # Upload APIM policy from entra-jwt-policy.xml
-    Write-Host "  Uploading APIM JWT validation policy..." -ForegroundColor Gray
-    $policyXml = Get-Content "$RepoRoot/policies/entra-jwt-policy.xml" -Raw
-    $body = @{ properties = @{ format = "rawxml"; value = $policyXml } } | ConvertTo-Json -Depth 3 -Compress
-    $policyFile = Join-Path $env:TEMP "apim-policy.json"
-    [System.IO.File]::WriteAllText($policyFile, $body, [System.Text.UTF8Encoding]::new($false))
+    if ($EnableJwt) {
+        # Fix JWT API path and backend service URL
+        Write-Host "  Configuring JWT-based API path and backend..." -ForegroundColor Gray
+        $aiEndpoint = az cognitiveservices account list --resource-group $ResourceGroupName `
+            --query "[?kind=='AIServices'].properties.endpoint | [0]" -o tsv
+        if ($aiEndpoint) {
+            az apim api update --resource-group $ResourceGroupName --service-name $ApimName `
+                --api-id azure-openai-api-jwt --set path=jwt/openai --service-url "${aiEndpoint}openai" -o none
+            Write-Host "    ✓ API path set to /jwt/openai, backend = ${aiEndpoint}openai" -ForegroundColor Green
+        } else {
+            Write-Host "    ⚠ No AI endpoint found — skipping API path update" -ForegroundColor DarkYellow
+        }
 
-    $policyUri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.ApiManagement/service/$ApimName/apis/azure-openai-api/policies/policy?api-version=2022-08-01"
-    az rest --method PUT --uri $policyUri --headers "Content-Type=application/json" --body "@$policyFile" -o none
-    if ($LASTEXITCODE -ne 0) { throw "Failed to upload APIM policy." }
-    Remove-Item $policyFile -ErrorAction SilentlyContinue
-    Write-Host "    ✓ APIM policy uploaded (entra-jwt-policy.xml)" -ForegroundColor Green
+        # Upload APIM policy from entra-jwt-policy.xml
+        Write-Host "  Uploading APIM JWT validation policy..." -ForegroundColor Gray
+        $policyXml = Get-Content "$RepoRoot/policies/entra-jwt-policy.xml" -Raw
+        $body = @{ properties = @{ format = "rawxml"; value = $policyXml } } | ConvertTo-Json -Depth 3 -Compress
+        $policyFile = Join-Path $env:TEMP "apim-policy.json"
+        [System.IO.File]::WriteAllText($policyFile, $body, [System.Text.UTF8Encoding]::new($false))
+
+        $policyUri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.ApiManagement/service/$ApimName/apis/azure-openai-api-jwt/policies/policy?api-version=2022-08-01"
+        az rest --method PUT --uri $policyUri --headers "Content-Type=application/json" --body "@$policyFile" -o none
+        if ($LASTEXITCODE -ne 0) { throw "Failed to upload APIM JWT policy." }
+        Remove-Item $policyFile -ErrorAction SilentlyContinue
+        Write-Host "    ✓ APIM policy uploaded (entra-jwt-policy.xml)" -ForegroundColor Green
+    } else {
+        Write-Host "    ⊘ JWT API disabled — skipping JWT policy upload" -ForegroundColor DarkGray
+    }
+
+    if ($EnableKeys) {
+        # Fix key-based API path and backend service URL
+        Write-Host "  Configuring key-based API path and backend..." -ForegroundColor Gray
+        $aiEndpoint = az cognitiveservices account list --resource-group $ResourceGroupName `
+            --query "[?kind=='AIServices'].properties.endpoint | [0]" -o tsv
+        if ($aiEndpoint) {
+            az apim api update --resource-group $ResourceGroupName --service-name $ApimName `
+                --api-id azure-openai-api-keys --set path=keys/openai --service-url "${aiEndpoint}openai" -o none
+            Write-Host "    ✓ API path set to /keys/openai, backend = ${aiEndpoint}openai" -ForegroundColor Green
+        } else {
+            Write-Host "    ⚠ No AI endpoint found — skipping API path update" -ForegroundColor DarkYellow
+        }
+
+        # Upload APIM policy from subscription-key-policy.xml
+        Write-Host "  Uploading APIM subscription-key policy..." -ForegroundColor Gray
+        $keyPolicyXml = Get-Content "$RepoRoot/policies/subscription-key-policy.xml" -Raw
+        $keyBody = @{ properties = @{ format = "rawxml"; value = $keyPolicyXml } } | ConvertTo-Json -Depth 3 -Compress
+        $keyPolicyFile = Join-Path $env:TEMP "apim-key-policy.json"
+        [System.IO.File]::WriteAllText($keyPolicyFile, $keyBody, [System.Text.UTF8Encoding]::new($false))
+
+        $keyPolicyUri = "https://management.azure.com/subscriptions/$subscriptionId/resourceGroups/$ResourceGroupName/providers/Microsoft.ApiManagement/service/$ApimName/apis/azure-openai-api-keys/policies/policy?api-version=2022-08-01"
+        az rest --method PUT --uri $keyPolicyUri --headers "Content-Type=application/json" --body "@$keyPolicyFile" -o none
+        if ($LASTEXITCODE -ne 0) { throw "Failed to upload subscription-key APIM policy." }
+        Remove-Item $keyPolicyFile -ErrorAction SilentlyContinue
+        Write-Host "    ✓ APIM policy uploaded (subscription-key-policy.xml)" -ForegroundColor Green
+    } else {
+        Write-Host "    ⊘ Key-based API disabled — skipping subscription-key policy upload" -ForegroundColor DarkGray
+    }
 
     Write-Host "  Phase 7 complete ✓" -ForegroundColor Green
     Write-Host ""
