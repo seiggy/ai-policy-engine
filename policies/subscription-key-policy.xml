@@ -13,24 +13,11 @@
 <policies>
 	<inbound>
 		<base />
-		<!-- Validate Entra ID (Azure AD) JWT token — uses /common for multi-tenant support -->
-		<validate-jwt header-name="Authorization" failed-validation-httpcode="401" failed-validation-error-message="Unauthorized. Access token is missing or invalid.">
-			<openid-config url="https://login.microsoftonline.com/common/.well-known/openid-configuration" />
-			<required-claims>
-				<claim name="aud" match="all">
-					<value>{{ExpectedAudience}}</value>
-				</claim>
-			</required-claims>
-		</validate-jwt>
-		<!-- Extract JWT claims into variables -->
-		<set-variable name="tenantId" value="@(context.Request.Headers.GetValueOrDefault("Authorization","").Split(' ').Last().AsJwt()?.Claims.GetValueOrDefault("tid",""))" />
-		<set-variable name="clientAppId" value="@{
-			var jwt = context.Request.Headers.GetValueOrDefault("Authorization","").Split(' ').Last().AsJwt();
-			// azp is present in delegated (user) tokens, appid in client_credentials tokens
-			var azp = jwt?.Claims.GetValueOrDefault("azp","");
-			return !string.IsNullOrEmpty(azp) ? azp : jwt?.Claims.GetValueOrDefault("appid","");
-		}" />
-		<set-variable name="audience" value="@(context.Request.Headers.GetValueOrDefault("Authorization","").Split(' ').Last().AsJwt()?.Claims.GetValueOrDefault("aud",""))" />
+		<!-- Subscription key is validated automatically by APIM when subscriptionRequired=true.
+		     Extract the subscription name as the client identifier. -->
+		<set-variable name="tenantId" value="key-based" />
+		<set-variable name="clientAppId" value="@(context.Subscription.Name)" />
+		<set-variable name="audience" value="subscription-key" />
 		<!-- Set variables for later use -->
 		<set-variable name="requestBody" value="@(context.Request.Body.As<string>(preserveContent: true))" />
 		<!-- Extract deploymentId from URL path (/deployments/{id}/...) or fall back to

@@ -13,6 +13,7 @@ variable "workload_name" {
 variable "subscription_id" {
   description = "Azure subscription ID"
   type        = string
+
 }
 
 variable "container_image" {
@@ -36,6 +37,7 @@ variable "apim_sku" {
 variable "apim_publisher_email" {
   description = "APIM publisher email"
   type        = string
+  default     = "admin@contoso.com"
 }
 
 variable "apim_publisher_name" {
@@ -48,6 +50,18 @@ variable "openai_api_spec_url" {
   description = "URL to the OpenAI API spec for APIM import. Set to empty string to use passthrough operations only."
   type        = string
   default     = ""
+}
+
+variable "enable_jwt" {
+  description = "Enable the JWT-authenticated OpenAI API endpoint."
+  type        = bool
+  default     = true
+}
+
+variable "enable_keys" {
+  description = "Enable the subscription-key-authenticated OpenAI API endpoint."
+  type        = bool
+  default     = true
 }
 
 variable "purview_client_app_id" {

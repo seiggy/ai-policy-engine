@@ -1,4 +1,4 @@
-<Project Sdk="Aspire.AppHost.Sdk/13.0.2">
+<Project Sdk="Aspire.AppHost.Sdk/13.2.0">
 
   <ItemGroup>
     <ProjectReference Include="..\Chargeback.Api\Chargeback.Api.csproj" />
