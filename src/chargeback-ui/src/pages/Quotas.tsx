@@ -27,6 +27,11 @@ export function Clients({ onSelectClient }: { onSelectClient?: (clientAppId: str
   const [clientPlanId, setClientPlanId] = useState("")
   const [clientDisplayName, setClientDisplayName] = useState("")
   const [clientAllowedDeployments, setClientAllowedDeployments] = useState<string[]>([])
+  const [authType, setAuthType] = useState<"key-based" | "entra-id">("entra-id")
+  const [tenantType, setTenantType] = useState<"primary" | "secondary">("primary")
+  const [subscriptionName, setSubscriptionName] = useState("")
+
+  const primaryTenantId = import.meta.env.VITE_AZURE_TENANT_ID ?? ""
 
   const loadData = useCallback(async () => {
     try {
@@ -55,6 +60,9 @@ export function Clients({ onSelectClient }: { onSelectClient?: (clientAppId: str
     setClientPlanId(plans.length > 0 ? plans[0].id : "")
     setClientDisplayName("")
     setClientAllowedDeployments([])
+    setAuthType("entra-id")
+    setTenantType("primary")
+    setSubscriptionName("")
     setClientDialogOpen(true)
   }
 
@@ -65,14 +73,36 @@ export function Clients({ onSelectClient }: { onSelectClient?: (clientAppId: str
     setClientPlanId(c.planId)
     setClientDisplayName(c.displayName)
     setClientAllowedDeployments(c.allowedDeployments ?? [])
+    if (c.tenantId === "key-based") {
+      setAuthType("key-based")
+      setSubscriptionName(c.clientAppId)
+    } else {
+      setAuthType("entra-id")
+      setSubscriptionName("")
+      if (c.tenantId === primaryTenantId) {
+        setTenantType("primary")
+      } else {
+        setTenantType("secondary")
+      }
+    }
     setClientDialogOpen(true)
   }
 
   const handleSaveClient = async () => {
     setSaving(true)
     try {
-      const appId = editingClientId?.clientAppId ?? clientAppIdInput
-      const tenant = editingClientId?.tenantId ?? clientTenantIdInput
+      let appId: string
+      let tenant: string
+      if (editingClientId) {
+        appId = editingClientId.clientAppId
+        tenant = editingClientId.tenantId
+      } else if (authType === "key-based") {
+        appId = subscriptionName
+        tenant = "key-based"
+      } else {
+        appId = clientAppIdInput
+        tenant = tenantType === "primary" ? primaryTenantId : clientTenantIdInput
+      }
       await assignClient(appId, tenant, {
         planId: clientPlanId,
         displayName: clientDisplayName || undefined,
@@ -231,24 +261,88 @@ export function Clients({ onSelectClient }: { onSelectClient?: (clientAppId: str
           <DialogTitle>{editingClientId ? "Edit Client Assignment" : "Assign Client"}</DialogTitle>
         </DialogHeader>
         <div className="mt-4 space-y-4">
-          <div className="space-y-2">
-            <label className="text-sm font-medium">Client App ID</label>
-            <Input
-              value={clientAppIdInput}
-              onChange={(e) => setClientAppIdInput(e.target.value)}
-              placeholder="Client application ID"
-              disabled={!!editingClientId}
-            />
-          </div>
-          <div className="space-y-2">
-            <label className="text-sm font-medium">Tenant ID</label>
-            <Input
-              value={clientTenantIdInput}
-              onChange={(e) => setClientTenantIdInput(e.target.value)}
-              placeholder="Tenant ID"
-              disabled={!!editingClientId}
-            />
-          </div>
+          {/* Auth type radio */}
+          {!editingClientId && (
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Authentication Type</label>
+              <div className="flex gap-4">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="authType"
+                    value="entra-id"
+                    checked={authType === "entra-id"}
+                    onChange={() => setAuthType("entra-id")}
+                    className="h-4 w-4 accent-[#0078D4]"
+                  />
+                  <span className="text-sm">Entra ID</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="authType"
+                    value="key-based"
+                    checked={authType === "key-based"}
+                    onChange={() => setAuthType("key-based")}
+                    className="h-4 w-4 accent-[#0078D4]"
+                  />
+                  <span className="text-sm">Key-based</span>
+                </label>
+              </div>
+            </div>
+          )}
+
+          {/* Key-based fields */}
+          {authType === "key-based" && (
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Subscription Name</label>
+              <Input
+                value={subscriptionName}
+                onChange={(e) => setSubscriptionName(e.target.value)}
+                placeholder="Subscription name"
+                disabled={!!editingClientId}
+              />
+            </div>
+          )}
+
+          {/* EntraID fields */}
+          {authType === "entra-id" && (
+            <>
+              {!editingClientId && (
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Tenant</label>
+                  <select
+                    className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    value={tenantType}
+                    onChange={(e) => setTenantType(e.target.value as "primary" | "secondary")}
+                  >
+                    <option value="primary">Primary Tenant{primaryTenantId ? ` (${primaryTenantId})` : ""}</option>
+                    <option value="secondary">Secondary Tenant</option>
+                  </select>
+                </div>
+              )}
+              {tenantType === "secondary" && (
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Tenant ID</label>
+                  <Input
+                    value={clientTenantIdInput}
+                    onChange={(e) => setClientTenantIdInput(e.target.value)}
+                    placeholder="Tenant ID"
+                    disabled={!!editingClientId}
+                  />
+                </div>
+              )}
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Client App ID</label>
+                <Input
+                  value={clientAppIdInput}
+                  onChange={(e) => setClientAppIdInput(e.target.value)}
+                  placeholder="Client application ID"
+                  disabled={!!editingClientId}
+                />
+              </div>
+            </>
+          )}
           <div className="space-y-2">
             <label className="text-sm font-medium">Plan</label>
             <select
@@ -305,7 +399,7 @@ export function Clients({ onSelectClient }: { onSelectClient?: (clientAppId: str
           </div>
           <div className="flex justify-end gap-2 pt-2">
             <Button variant="outline" onClick={() => setClientDialogOpen(false)}>Cancel</Button>
-            <Button onClick={handleSaveClient} disabled={saving || (!editingClientId && (!clientAppIdInput || !clientTenantIdInput)) || !clientPlanId}>
+            <Button onClick={handleSaveClient} disabled={saving || (!editingClientId && (authType === "key-based" ? !subscriptionName : (!clientAppIdInput || (tenantType === "secondary" && !clientTenantIdInput)))) || !clientPlanId}>
               {saving ? "Saving…" : editingClientId ? "Update" : "Assign"}
             </Button>
           </div>
