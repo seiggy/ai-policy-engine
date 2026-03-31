@@ -1,0 +1,1 @@
+squad: McNulty architecture proposal for model routing + pricing
