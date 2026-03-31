@@ -21,6 +21,35 @@
 
 <!-- Append new learnings below. Each entry is something lasting about the project. -->
 
+### 2026-03-31 — Phase 0 Complete: CosmosDB Source of Truth + Repository Pattern
+
+**Phase 0 Status:** ✅ COMPLETE (Freamon + Bunk)
+- Storage architecture migrated: CosmosDB is now the durable source of truth; Redis is a write-through cache.
+- Repository pattern implemented: `IRepository<T>` abstraction with four concrete repositories (`CosmosPlanRepository`, `CosmosClientRepository`, `CosmosPricingRepository`, `CosmosUsagePolicyRepository`).
+- `CachedRepository<T>` wrapper enforces write-through semantics (persist to Cosmos first, then update Redis).
+- All endpoints refactored to use repositories instead of direct Redis calls.
+- Startup migration and cache warming services in place for backward compatibility and performance.
+- **Test Results:** 36 new tests written (B5.1–B5.2), 129/129 tests pass, zero regressions.
+
+**What This Means for Phase 1 Onwards:**
+- All future work (routing, pricing, policy enhancements) now builds on stable repositories.
+- No more Redis-only data — all configuration data is durable.
+- `IRepository<T>` is the extension point for new entities (e.g., `CosmosModelRoutingPolicyRepository` for Phase 1).
+- Caching is transparent to callers — endpoint logic unchanged, but storage is now production-safe.
+
+**Files:**
+- New: `Repositories/` (5 files), `Services/RedisToCosmossMigrationService.cs`, `Services/CacheWarmingService.cs`, `Services/RepositoryServiceExtensions.cs`
+- Refactored: All endpoints + `Program.cs` + `ConfigurationContainerInitializer.cs`
+- Tests: 3 new test files (CachedRepositoryTests, RedisToCosmossMigrationServiceTests, CacheWarmingServiceTests)
+
+**Architecture v2 Accepted:**
+- Decision 1: CosmosDB is source of truth, Redis is cache (Phase 0 — COMPLETE)
+- Decision 2: Per-REQUEST multiplier (not per-token) — Phase 2–3 work
+- Decision 3: Foundry deployment discovery (no pattern matching) — Phase 1 work
+- Decision 4: Rate limits on routed deployment — Phase 1 work
+
+**Next Phase:** Phase 1 (Model Routing) — Freamon will add `CosmosModelRoutingPolicyRepository` + routing logic at precheck; Bunk will add routing tests.
+
 ### 2026-03-31 — Deep Architecture Exploration + Feature Design
 
 **Codebase Architecture:**
