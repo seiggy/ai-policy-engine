@@ -31,12 +31,8 @@ param containerAppClientId string = ''
 @description('ACR login server for Container App image pull (e.g. myacr.azurecr.io).')
 param acrLoginServer string = ''
 
-@description('ACR admin username.')
-param acrUsername string = ''
-
-@secure()
-@description('ACR admin password.')
-param acrPassword string = ''
+@description('ACR resource name for AcrPull role assignment. Required when acrLoginServer is set.')
+param acrName string = ''
 
 @minLength(3)
 @maxLength(24)
@@ -172,8 +168,6 @@ module containerApp './containerApp.bicep' = {
     entraIdTenantId: entraIdTenantId
     containerAppClientId: containerAppClientId
     acrLoginServer: acrLoginServer
-    acrUsername: acrUsername
-    acrPassword: acrPassword
     minReplicas: 1
     maxReplicas: 10
   }
@@ -304,8 +298,8 @@ module roleAssignmentApim './roleAssignment.bicep' = {
   name: 'assignKeyVaultRoleToApim'
   scope: resourceGroup()
   params: {
-    principalId: apimInstance.outputs.clientId // APIM needs access to Key Vault
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '7f951dda-4ed3-4680-a7ca-43fe172d538d') // Key Vault Secrets User role
+    principalId: apimInstance.outputs.clientId
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.security.keyVaultSecretsUser) // Key Vault Secrets User
   }
 }
 
@@ -313,18 +307,22 @@ module roleAssignmentOpenAi './roleAssignment.bicep' = {
   name: 'assignOpenAiRoleToApim'
   scope: resourceGroup()
   params: {
-    principalId: apimInstance.outputs.clientId    
-    roleDefinitionId: '/subscriptions/${subscription().subscriptionId}/providers/Microsoft.Authorization/roleDefinitions/${roles.ai.cognitiveServicesUser}'  // Role definition for accessing OpenAI
+    principalId: apimInstance.outputs.clientId
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.ai.cognitiveServicesOpenAIUser) // Cognitive Services OpenAI User (least privilege)
   }
 }
 
 
-module roleAssignmentContainerAppApim './roleAssignment.bicep' = {
-  name: 'assignContainerAppRoleToApim'
+// APIM calls Container App via Entra ID managed identity token — no Azure RBAC role needed.
+// Contributor role removed: APIM only needs Cognitive Services OpenAI User + Key Vault Secrets User.
+
+// AcrPull role for Container App managed identity — replaces admin credentials for image pulls
+module roleAssignmentContainerAppAcr './roleAssignment.bicep' = if (!empty(acrName)) {
+  name: 'assignAcrPullRoleToContainerApp'
   scope: resourceGroup()
   params: {
-    principalId: apimInstance.outputs.clientId // APIM needs access to Container App
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b24988ac-6180-42a0-ab88-20f7382dd24c') // Contributor role    
+    principalId: containerApp.outputs.containerAppPrincipalId
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', roles.containers.acrPull) // AcrPull
   }
 }
 

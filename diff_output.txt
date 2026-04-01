@@ -1,0 +1,3073 @@
+warning: in the working copy of '.gitignore', LF will be replaced by CRLF the next time Git touches it
+diff --git a/.gitignore b/.gitignore
+index 658dc21..7a4b0bc 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -92,4 +92,11 @@ src/Chargeback.LoadTest/reports/
+ 
+ .agentic/
+ .agentic-dev.json
+-.github/skills/
+\ No newline at end of file
++.github/skills/
++# Squad: ignore runtime state (logs, inbox, sessions)
++.squad/orchestration-log/
++.squad/log/
++.squad/decisions/inbox/
++.squad/sessions/
++# Squad: SubSquad activation file (local to this machine)
++.squad-workstream
+diff --git a/.squad/commit-message.txt b/.squad/commit-message.txt
+deleted file mode 100644
+index efbc076..0000000
+--- a/.squad/commit-message.txt
++++ /dev/null
+@@ -1,16 +0,0 @@
+-squad: All phases complete ΓÇö model routing, multiplier pricing, APIM auto-router, frontend UI, 222 tests
+-
+-Phase 0 (Storage): CosmosDB source of truth + Redis cache, repository pattern, 36 tests
+-Phase 1 (Routing/Pricing): Model routing evaluation, per-request multiplier billing, 41 unit + 30 integration tests
+-Phase 2 (Enforcement): Precheck endpoint extended, audit trail with multiplier metadata, validation strict
+-Phase 3 (APIM Policies): Auto-router logic in subscription-key and entra-jwt policies, request logging extended
+-Phase 4 (Frontend UI): RoutingPolicies page, RequestBilling dashboard, adaptive billing UI, 5 pages extended
+-Phase 5 (Testing): 15 Cosmos resilience tests, 7 routing latency validation tests, BenchmarkDotNet suite
+-
+-Total: 222 tests passing, routing sub-microsecond, precheck <5ms p99
+-Orchestration logs: Sydnor (Phase 3), Kima (Phase 4), Bunk (Phase 5)
+-Session log: 2026-03-31T16-50-all-phases-complete.md
+-Decisions merged: copilot-directive auto-router clarification added to decisions.md
+-Agent histories updated: all agents with completion status
+-
+-Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+diff --git a/src/Chargeback.Api/Endpoints/ClientDetailEndpoints.cs b/src/Chargeback.Api/Endpoints/ClientDetailEndpoints.cs
+index e5e1f84..2194b02 100644
+--- a/src/Chargeback.Api/Endpoints/ClientDetailEndpoints.cs
++++ b/src/Chargeback.Api/Endpoints/ClientDetailEndpoints.cs
+@@ -33,20 +33,18 @@ public static class ClientDetailEndpoints
+     private static async Task<IResult> GetClientUsage(
+         string clientAppId,
+         string tenantId,
+-        IConnectionMultiplexer redis,
++        IRepository<ClientPlanAssignment> clientRepo,
++        IRepository<PlanData> planRepo,
+         IUsagePolicyStore usagePolicyStore,
++        IConnectionMultiplexer redis,
+         ILogger<ClientUsageResponse> logger)
+     {
+         try
+         {
+-            var db = redis.GetDatabase();
+-            var usagePolicy = await usagePolicyStore.GetAsync(db);
++            var usagePolicy = await usagePolicyStore.GetAsync();
+ 
+-            var clientValue = await db.StringGetAsync(RedisKeys.Client(clientAppId, tenantId));
+-            if (!clientValue.HasValue)
+-                return Results.NotFound(new { error = $"Customer '{clientAppId}/{tenantId}' not found" });
+-
+-            var assignment = JsonSerializer.Deserialize<ClientPlanAssignment>((string)clientValue!, JsonConfig.Default);
++            var clientId = $"{clientAppId}:{tenantId}";
++            var assignment = await clientRepo.GetAsync(clientId);
+             if (assignment is null)
+                 return Results.NotFound(new { error = $"Customer '{clientAppId}/{tenantId}' not found" });
+ 
+@@ -57,13 +55,17 @@ public static class ClientDetailEndpoints
+                 assignment.CurrentPeriodUsage = 0;
+                 assignment.OverbilledTokens = 0;
+                 assignment.DeploymentUsage = new();
++                assignment.CurrentPeriodRequests = 0;
++                assignment.OverbilledRequests = 0;
++                assignment.RequestsByTier = new();
+             }
+ 
+             PlanData? plan = null;
+-            var planValue = await db.StringGetAsync(RedisKeys.Plan(assignment.PlanId));
+-            if (planValue.HasValue)
+-                plan = JsonSerializer.Deserialize<PlanData>((string)planValue!, JsonConfig.Default);
++            if (!string.IsNullOrEmpty(assignment.PlanId))
++                plan = await planRepo.GetAsync(assignment.PlanId);
+ 
++            // Log data and rate limits are ephemeral ΓÇö stay Redis-direct
++            var db = redis.GetDatabase();
+             var logKeys = redis.KeysFromAllServers(RedisKeys.CustomerLogPattern(clientAppId, tenantId));
+             var logs = new List<LogEntry>();
+             var usageByModel = new Dictionary<string, long>();
+@@ -126,7 +128,14 @@ public static class ClientDetailEndpoints
+                 CurrentTpm = tpmValue.HasValue ? (long)tpmValue : 0,
+                 CurrentRpm = rpmValue.HasValue ? (long)rpmValue : 0,
+                 TotalCostToUs = totalCostToUs,
+-                TotalCostToCustomer = totalCostToCustomer
++                TotalCostToCustomer = totalCostToCustomer,
++                CurrentPeriodRequests = assignment.CurrentPeriodRequests,
++                OverbilledRequests = assignment.OverbilledRequests,
++                RequestsByTier = assignment.RequestsByTier,
++                MonthlyRequestQuota = plan?.MonthlyRequestQuota ?? 0,
++                RequestUtilizationPercent = plan is not null && plan.MonthlyRequestQuota > 0
++                    ? Math.Round(assignment.CurrentPeriodRequests / plan.MonthlyRequestQuota * 100, 2)
++                    : -1
+             };
+ 
+             return Results.Json(response, JsonConfig.Default);
+@@ -146,6 +155,7 @@ public static class ClientDetailEndpoints
+     {
+         try
+         {
++            // Traces are ephemeral ΓÇö Redis-only
+             var db = redis.GetDatabase();
+             var entries = await db.ListRangeAsync(RedisKeys.Traces(clientAppId, tenantId), 0, 99);
+ 
+diff --git a/src/Chargeback.Api/Endpoints/LogIngestEndpoints.cs b/src/Chargeback.Api/Endpoints/LogIngestEndpoints.cs
+index c75c483..6a79912 100644
+--- a/src/Chargeback.Api/Endpoints/LogIngestEndpoints.cs
++++ b/src/Chargeback.Api/Endpoints/LogIngestEndpoints.cs
+@@ -36,6 +36,8 @@ public static class LogIngestEndpoints
+     private static async Task<IResult> IngestLog(
+         HttpRequest request,
+         IConnectionMultiplexer redis,
++        IRepository<ClientPlanAssignment> clientRepo,
++        IRepository<PlanData> planRepo,
+         IUsagePolicyStore usagePolicyStore,
+         IChargebackCalculator calculator,
+         ChargebackMetrics metrics,
+@@ -76,7 +78,7 @@ public static class LogIngestEndpoints
+         try
+         {
+             var db = redis.GetDatabase();
+-            var usagePolicy = await usagePolicyStore.GetAsync(db);
++            var usagePolicy = await usagePolicyStore.GetAsync();
+             var logCacheTtl = TimeSpan.FromDays(usagePolicy.AggregatedLogRetentionDays);
+             var traceCacheTtl = TimeSpan.FromDays(usagePolicy.TraceRetentionDays);
+             var lockToken = (RedisValue)Guid.NewGuid().ToString("N");
+@@ -89,30 +91,42 @@ public static class LogIngestEndpoints
+ 
+             CachedLogData? logData = null;
+             ClientPlanAssignment? clientAssignment = null;
++            decimal? effectiveRequestCost = null;
++            decimal? multiplier = null;
++            string? tierName = null;
++            decimal? multiplierOverageCost = null;
+ 
+             try
+             {
+                 // --- 1. Client Authorization Check ---
+-                IResult? authError;
+-                (clientAssignment, authError) = await AuthorizeClient(db, ingestRequest.ClientAppId, ingestRequest.TenantId, logger);
+-                if (authError is not null) return authError;
++                var clientId = $"{ingestRequest.ClientAppId}:{ingestRequest.TenantId}";
++                clientAssignment = await clientRepo.GetAsync(clientId);
++                if (clientAssignment is null)
++                {
++                    logger.LogWarning("Unauthorized client: {ClientAppId}/{TenantId} ΓÇö no plan assigned", ingestRequest.ClientAppId, ingestRequest.TenantId);
++                    return Results.Json(new { error = "Client not authorized ΓÇö no plan assigned" }, statusCode: StatusCodes.Status401Unauthorized);
++                }
+ 
+                 // --- 2. Plan Lookup ---
+-                var (plan, planError) = await LookupPlan(db, clientAssignment!.PlanId, ingestRequest.ClientAppId, logger);
+-                if (planError is not null) return planError;
++                var plan = await planRepo.GetAsync(clientAssignment.PlanId);
++                if (plan is null)
++                {
++                    logger.LogError("Plan not found: {PlanId} for client {ClientAppId}", clientAssignment.PlanId, ingestRequest.ClientAppId);
++                    return Results.Json(new { error = "Plan configuration not found" }, statusCode: StatusCodes.Status500InternalServerError);
++                }
+ 
+                 // --- 3. Update rate limit meters (outbound ΓÇö record actual token usage) ---
+                 var now = DateTimeOffset.UtcNow;
+                 var minuteWindow = now.ToUnixTimeSeconds() / 60;
+                 var totalTokensInRequest = usage?.TotalTokens ?? 0;
+ 
+-                await UpdateTpmCounter(db, plan!, ingestRequest.ClientAppId, ingestRequest.TenantId, minuteWindow, totalTokensInRequest, logger);
++                await UpdateTpmCounter(db, plan, ingestRequest.ClientAppId, ingestRequest.TenantId, minuteWindow, totalTokensInRequest, logger);
+ 
+                 // --- 4. Quota Check + Overbilling ---
+-                ResetBillingPeriodIfNeeded(clientAssignment!, usagePolicy.BillingCycleStartDay, DateTime.UtcNow);
++                ResetBillingPeriodIfNeeded(clientAssignment, usagePolicy.BillingCycleStartDay, DateTime.UtcNow);
+ 
+                 var newUsage = clientAssignment.CurrentPeriodUsage + totalTokensInRequest;
+-                var isOverQuota = newUsage > plan!.MonthlyTokenQuota;
++                var isOverQuota = newUsage > plan.MonthlyTokenQuota;
+ 
+                 if (isOverQuota)
+                 {
+@@ -143,6 +157,40 @@ public static class LogIngestEndpoints
+                 var requestCostToCustomer = logData.CostToCustomer;
+                 var requestIsOverbilled = logData.IsOverbilled;
+ 
++                // --- 5b. Multiplier billing ---
++                effectiveRequestCost = null;
++                multiplier = null;
++                tierName = null;
++                multiplierOverageCost = null;
++
++                if (plan.UseMultiplierBilling)
++                {
++                    effectiveRequestCost = calculator.CalculateEffectiveRequestCost(logData);
++                    multiplier = calculator.GetMultiplier(logData.DeploymentId, logData.Model);
++                    tierName = calculator.GetTierName(logData.DeploymentId, logData.Model);
++
++                    // Update request counters
++                    clientAssignment.CurrentPeriodRequests += effectiveRequestCost.Value;
++                    if (!string.IsNullOrEmpty(tierName))
++                    {
++                        if (!clientAssignment.RequestsByTier.ContainsKey(tierName))
++                            clientAssignment.RequestsByTier[tierName] = 0m;
++                        clientAssignment.RequestsByTier[tierName] += effectiveRequestCost.Value;
++                    }
++
++                    // Check request-based overage
++                    if (plan.MonthlyRequestQuota > 0 && clientAssignment.CurrentPeriodRequests > plan.MonthlyRequestQuota)
++                    {
++                        var overageAmount = clientAssignment.CurrentPeriodRequests - plan.MonthlyRequestQuota;
++                        clientAssignment.OverbilledRequests = overageAmount;
++                    }
++
++                    multiplierOverageCost = calculator.CalculateMultiplierOverageCost(
++                        effectiveRequestCost.Value,
++                        clientAssignment.CurrentPeriodRequests - effectiveRequestCost.Value,
++                        plan);
++                }
++
+                 // Update client assignment usage
+                 clientAssignment.CurrentPeriodUsage = newUsage;
+                 if (isOverQuota)
+@@ -154,11 +202,10 @@ public static class LogIngestEndpoints
+ 
+                 clientAssignment.LastUpdated = DateTime.UtcNow;
+ 
+-                var clientKey = RedisKeys.Client(ingestRequest.ClientAppId, ingestRequest.TenantId);
+-                var updatedClientValue = JsonSerializer.Serialize(clientAssignment, JsonConfig.Default);
+-                await db.StringSetAsync(clientKey, updatedClientValue);
++                // Persist client assignment via repository (Cosmos ΓåÆ Redis cache)
++                await clientRepo.UpsertAsync(clientAssignment);
+ 
+-                // --- Aggregate into log cache ---
++                // --- Aggregate into log cache (ephemeral ΓÇö stays Redis-direct) ---
+                 var cacheKey = RedisKeys.LogEntry(logData.ClientAppId, logData.TenantId, logData.DeploymentId);
+                 var existingValue = await db.StringGetAsync(cacheKey);
+ 
+@@ -184,7 +231,7 @@ public static class LogIngestEndpoints
+                     "Log data cached: Key={CacheKey}, TenantId={TenantId}, ClientAppId={ClientAppId}, DeploymentId={DeploymentId}, Model={Model}, TotalTokens={TotalTokens}",
+                     cacheKey, logData.TenantId, logData.ClientAppId, logData.DeploymentId, logData.Model, logData.TotalTokens);
+ 
+-                // Record trace for client detail page
++                // Record trace for client detail page (ephemeral ΓÇö stays Redis-direct)
+                 var trace = new TraceRecord
+                 {
+                     Timestamp = DateTime.UtcNow,
+@@ -247,7 +294,13 @@ public static class LogIngestEndpoints
+                 CostToCustomer = logData?.CostToCustomer.ToString("F4") ?? "0.0000",
+                 IsOverbilled = logData?.IsOverbilled ?? false,
+                 StatusCode = 200,
+-                Timestamp = DateTime.UtcNow
++                Timestamp = DateTime.UtcNow,
++                RequestedDeploymentId = ingestRequest.DeploymentId,
++                RoutingPolicyId = null, // routing metadata comes from precheck; log ingest records the deployment that was actually used
++                Multiplier = multiplier,
++                EffectiveRequestCost = effectiveRequestCost,
++                TierName = tierName,
++                MultiplierOverageCost = multiplierOverageCost
+             });
+ 
+             return Results.Ok("Log data processed and stored successfully");
+@@ -298,42 +351,6 @@ public static class LogIngestEndpoints
+         }
+     }
+ 
+-    private static async Task<(ClientPlanAssignment? assignment, IResult? error)> AuthorizeClient(
+-        IDatabase db, string clientAppId, string tenantId, ILogger logger)
+-    {
+-        var clientValue = await db.StringGetAsync(RedisKeys.Client(clientAppId, tenantId));
+-        if (!clientValue.HasValue)
+-        {
+-            logger.LogWarning("Unauthorized client: {ClientAppId}/{TenantId} ΓÇö no plan assigned", clientAppId, tenantId);
+-            return (null, Results.Json(new { error = "Client not authorized ΓÇö no plan assigned" }, statusCode: StatusCodes.Status401Unauthorized));
+-        }
+-        var assignment = JsonSerializer.Deserialize<ClientPlanAssignment>((string)clientValue!, JsonConfig.Default);
+-        if (assignment is null)
+-        {
+-            logger.LogError("Invalid client assignment payload for {ClientAppId}/{TenantId}", clientAppId, tenantId);
+-            return (null, Results.Json(new { error = "Client assignment is invalid" }, statusCode: StatusCodes.Status500InternalServerError));
+-        }
+-        return (assignment, null);
+-    }
+-
+-    private static async Task<(PlanData? plan, IResult? error)> LookupPlan(
+-        IDatabase db, string planId, string clientAppId, ILogger logger)
+-    {
+-        var planValue = await db.StringGetAsync(RedisKeys.Plan(planId));
+-        if (!planValue.HasValue)
+-        {
+-            logger.LogError("Plan not found: {PlanId} for client {ClientAppId}", planId, clientAppId);
+-            return (null, Results.Json(new { error = "Plan configuration not found" }, statusCode: StatusCodes.Status500InternalServerError));
+-        }
+-        var plan = JsonSerializer.Deserialize<PlanData>((string)planValue!, JsonConfig.Default);
+-        if (plan is null)
+-        {
+-            logger.LogError("Invalid plan payload: {PlanId} for client {ClientAppId}", planId, clientAppId);
+-            return (null, Results.Json(new { error = "Plan configuration is invalid" }, statusCode: StatusCodes.Status500InternalServerError));
+-        }
+-        return (plan, null);
+-    }
+-
+     private static async Task UpdateTpmCounter(
+         IDatabase db, PlanData plan, string clientAppId, string tenantId, long minuteWindow, long totalTokens, ILogger logger)
+     {
+@@ -358,6 +375,9 @@ public static class LogIngestEndpoints
+             assignment.CurrentPeriodUsage = 0;
+             assignment.OverbilledTokens = 0;
+             assignment.DeploymentUsage = new();
++            assignment.CurrentPeriodRequests = 0;
++            assignment.OverbilledRequests = 0;
++            assignment.RequestsByTier = new();
+         }
+     }
+ }
+diff --git a/src/Chargeback.Api/Endpoints/PlanEndpoints.cs b/src/Chargeback.Api/Endpoints/PlanEndpoints.cs
+index 1ebf38f..c36c570 100644
+--- a/src/Chargeback.Api/Endpoints/PlanEndpoints.cs
++++ b/src/Chargeback.Api/Endpoints/PlanEndpoints.cs
+@@ -7,6 +7,7 @@ namespace Chargeback.Api.Endpoints;
+ 
+ /// <summary>
+ /// Plan and client assignment management endpoints for the billing system.
++/// Backed by Cosmos (source of truth) + Redis cache via IRepository.
+ /// </summary>
+ public static class PlanEndpoints
+ {
+@@ -76,34 +77,13 @@ public static class PlanEndpoints
+     // ΓöÇΓöÇ Plan CRUD ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+ 
+     private static async Task<IResult> GetPlans(
+-        IConnectionMultiplexer redis,
++        IRepository<PlanData> planRepo,
+         ILogger<PlansResponse> logger)
+     {
+         try
+         {
+-            var db = redis.GetDatabase();
+-            var keys = redis.KeysFromAllServers(RedisKeys.PlanPrefix);
+-
+-            logger.LogInformation("Fetched {KeyCount} plan keys from Redis", keys.Length);
+-
+-            var plans = new List<PlanData>();
+-            foreach (var key in keys)
+-            {
+-                var value = await db.StringGetAsync(key);
+-                if (!value.HasValue) continue;
+-
+-                try
+-                {
+-                    var plan = JsonSerializer.Deserialize<PlanData>((string)value!, JsonConfig.Default);
+-                    if (plan is not null)
+-                        plans.Add(plan);
+-                }
+-                catch (JsonException ex)
+-                {
+-                    logger.LogError(ex, "Failed to deserialize plan for key {Key}", key);
+-                }
+-            }
+-
++            var plans = await planRepo.GetAllAsync();
++            logger.LogInformation("Fetched {Count} plans", plans.Count);
+             return Results.Json(new PlansResponse { Plans = plans }, JsonConfig.Default);
+         }
+         catch (Exception ex)
+@@ -115,7 +95,7 @@ public static class PlanEndpoints
+ 
+     private static async Task<IResult> CreatePlan(
+         PlanCreateRequest body,
+-        IConnectionMultiplexer redis,
++        IRepository<PlanData> planRepo,
+         ILogger<PlanData> logger)
+     {
+         try
+@@ -125,12 +105,11 @@ public static class PlanEndpoints
+ 
+             var normalizedName = NormalizePlanName(body.Name);
+ 
++            if (await PlanNameExistsAsync(planRepo, normalizedName))
++                return Results.Conflict(new { error = $"Plan name '{normalizedName}' already exists" });
++
+             var id = Guid.NewGuid().ToString("N")[..8];
+             var now = DateTime.UtcNow;
+-            var db = redis.GetDatabase();
+-
+-            if (await PlanNameExistsAsync(db, redis, normalizedName, logger))
+-                return Results.Conflict(new { error = $"Plan name '{normalizedName}' already exists" });
+ 
+             var plan = new PlanData
+             {
+@@ -145,16 +124,18 @@ public static class PlanEndpoints
+                 RollUpAllDeployments = body.RollUpAllDeployments ?? true,
+                 DeploymentQuotas = body.DeploymentQuotas ?? new(),
+                 AllowedDeployments = body.AllowedDeployments ?? [],
++                ModelRoutingPolicyId = body.ModelRoutingPolicyId,
++                MonthlyRequestQuota = body.MonthlyRequestQuota ?? 0,
++                OverageRatePerRequest = body.OverageRatePerRequest ?? 0,
++                UseMultiplierBilling = body.UseMultiplierBilling ?? false,
+                 CreatedAt = now,
+                 UpdatedAt = now
+             };
+ 
+-            var cacheKey = RedisKeys.Plan(id);
+-            var cacheValue = JsonSerializer.Serialize(plan, JsonConfig.Default);
+-            await db.StringSetAsync(cacheKey, cacheValue);
++            var persisted = await planRepo.UpsertAsync(plan);
+ 
+             logger.LogInformation("Plan created: Id={PlanId}, Name={Name}", id, plan.Name);
+-            return Results.Json(plan, JsonConfig.Default, statusCode: StatusCodes.Status201Created);
++            return Results.Json(persisted, JsonConfig.Default, statusCode: StatusCodes.Status201Created);
+         }
+         catch (Exception ex)
+         {
+@@ -166,19 +147,12 @@ public static class PlanEndpoints
+     private static async Task<IResult> UpdatePlan(
+         string planId,
+         PlanUpdateRequest body,
+-        IConnectionMultiplexer redis,
++        IRepository<PlanData> planRepo,
+         ILogger<PlanData> logger)
+     {
+         try
+         {
+-            var db = redis.GetDatabase();
+-            var cacheKey = RedisKeys.Plan(planId);
+-            var existing = await db.StringGetAsync(cacheKey);
+-
+-            if (!existing.HasValue)
+-                return Results.NotFound(new { error = $"Plan '{planId}' not found" });
+-
+-            var plan = JsonSerializer.Deserialize<PlanData>((string)existing!, JsonConfig.Default);
++            var plan = await planRepo.GetAsync(planId);
+             if (plan is null)
+                 return Results.NotFound(new { error = $"Plan '{planId}' not found" });
+ 
+@@ -188,7 +162,7 @@ public static class PlanEndpoints
+                     return Results.BadRequest("Plan name is required");
+ 
+                 var normalizedName = NormalizePlanName(body.Name);
+-                if (await PlanNameExistsAsync(db, redis, normalizedName, logger, excludedPlanId: planId))
++                if (await PlanNameExistsAsync(planRepo, normalizedName, excludedPlanId: planId))
+                     return Results.Conflict(new { error = $"Plan name '{normalizedName}' already exists" });
+ 
+                 plan.Name = normalizedName;
+@@ -202,13 +176,16 @@ public static class PlanEndpoints
+             if (body.RollUpAllDeployments.HasValue) plan.RollUpAllDeployments = body.RollUpAllDeployments.Value;
+             if (body.DeploymentQuotas is not null) plan.DeploymentQuotas = body.DeploymentQuotas;
+             if (body.AllowedDeployments is not null) plan.AllowedDeployments = body.AllowedDeployments;
++            if (body.ModelRoutingPolicyId is not null) plan.ModelRoutingPolicyId = body.ModelRoutingPolicyId.Length > 0 ? body.ModelRoutingPolicyId : null;
++            if (body.MonthlyRequestQuota.HasValue) plan.MonthlyRequestQuota = body.MonthlyRequestQuota.Value;
++            if (body.OverageRatePerRequest.HasValue) plan.OverageRatePerRequest = body.OverageRatePerRequest.Value;
++            if (body.UseMultiplierBilling.HasValue) plan.UseMultiplierBilling = body.UseMultiplierBilling.Value;
+             plan.UpdatedAt = DateTime.UtcNow;
+ 
+-            var cacheValue = JsonSerializer.Serialize(plan, JsonConfig.Default);
+-            await db.StringSetAsync(cacheKey, cacheValue);
++            var persisted = await planRepo.UpsertAsync(plan);
+ 
+             logger.LogInformation("Plan updated: Id={PlanId}", planId);
+-            return Results.Json(plan, JsonConfig.Default);
++            return Results.Json(persisted, JsonConfig.Default);
+         }
+         catch (Exception ex)
+         {
+@@ -219,15 +196,13 @@ public static class PlanEndpoints
+ 
+     private static async Task<IResult> DeletePlan(
+         string planId,
+-        IConnectionMultiplexer redis,
++        IRepository<PlanData> planRepo,
++        IRepository<ClientPlanAssignment> clientRepo,
+         ILogger<PlanData> logger)
+     {
+         try
+         {
+-            var db = redis.GetDatabase();
+-            var cacheKey = RedisKeys.Plan(planId);
+-
+-            var assignedClientIds = await GetAssignedClientIdsAsync(db, redis, planId, logger);
++            var assignedClientIds = await GetAssignedClientIdsAsync(clientRepo, planId);
+             if (assignedClientIds.Count > 0)
+             {
+                 return Results.Conflict(new
+@@ -237,7 +212,7 @@ public static class PlanEndpoints
+                 });
+             }
+ 
+-            var deleted = await db.KeyDeleteAsync(cacheKey);
++            var deleted = await planRepo.DeleteAsync(planId);
+ 
+             if (!deleted)
+                 return Results.NotFound(new { error = $"Plan '{planId}' not found" });
+@@ -255,55 +230,47 @@ public static class PlanEndpoints
+     // ΓöÇΓöÇ Client Assignment CRUD ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
+ 
+     private static async Task<IResult> GetClients(
+-        IConnectionMultiplexer redis,
++        IRepository<ClientPlanAssignment> clientRepo,
+         IUsagePolicyStore usagePolicyStore,
++        IConnectionMultiplexer redis,
+         ILogger<ClientsResponse> logger)
+     {
+         try
+         {
+-            var db = redis.GetDatabase();
+-            var usagePolicy = await usagePolicyStore.GetAsync(db);
++            var usagePolicy = await usagePolicyStore.GetAsync();
+             var expectedPeriodStart = BillingPeriodCalculator.GetCurrentPeriodStartUtc(DateTime.UtcNow, usagePolicy.BillingCycleStartDay);
+-            var keys = redis.KeysFromAllServers(RedisKeys.ClientPrefix);
+-
+-            logger.LogInformation("Fetched {KeyCount} client keys from Redis", keys.Length);
++            var allClients = await clientRepo.GetAllAsync();
+ 
++            var db = redis.GetDatabase();
+             var clients = new List<ClientPlanAssignment>();
+-            foreach (var key in keys)
++
++            foreach (var client in allClients)
+             {
+-                var value = await db.StringGetAsync(key);
+-                if (!value.HasValue) continue;
++                // Skip stale keys from pre-migration format (missing tenantId)
++                if (string.IsNullOrWhiteSpace(client.TenantId)) continue;
+ 
+-                try
+-                {
+-                    var client = JsonSerializer.Deserialize<ClientPlanAssignment>((string)value!, JsonConfig.Default);
+-                    if (client is null) continue;
+-
+-                    // Skip stale keys from pre-migration format (missing tenantId)
+-                    if (string.IsNullOrWhiteSpace(client.TenantId)) continue;
+-
+-                    if (client.CurrentPeriodStart != expectedPeriodStart)
+-                    {
+-                        client.CurrentPeriodUsage = 0;
+-                        client.OverbilledTokens = 0;
+-                        client.DeploymentUsage = new();
+-                        client.CurrentPeriodStart = expectedPeriodStart;
+-                    }
+-
+-                    var minuteWindow = DateTimeOffset.UtcNow.ToUnixTimeSeconds() / 60;
+-                    var rpmVal = await db.StringGetAsync(RedisKeys.RateLimitRpm(client.ClientAppId, client.TenantId, minuteWindow));
+-                    var tpmVal = await db.StringGetAsync(RedisKeys.RateLimitTpm(client.ClientAppId, client.TenantId, minuteWindow));
+-                    client.CurrentRpm = rpmVal.HasValue ? (long)rpmVal : 0;
+-                    client.CurrentTpm = tpmVal.HasValue ? (long)tpmVal : 0;
+-
+-                    clients.Add(client);
+-                }
+-                catch (JsonException ex)
++                if (client.CurrentPeriodStart != expectedPeriodStart)
+                 {
+-                    logger.LogError(ex, "Failed to deserialize client for key {Key}", key);
++                    client.CurrentPeriodUsage = 0;
++                    client.OverbilledTokens = 0;
++                    client.DeploymentUsage = new();
++                    client.CurrentPeriodRequests = 0;
++                    client.OverbilledRequests = 0;
++                    client.RequestsByTier = new();
++                    client.CurrentPeriodStart = expectedPeriodStart;
+                 }
++
++                // Rate limit data is ephemeral ΓÇö stays Redis-direct
++                var minuteWindow = DateTimeOffset.UtcNow.ToUnixTimeSeconds() / 60;
++                var rpmVal = await db.StringGetAsync(RedisKeys.RateLimitRpm(client.ClientAppId, client.TenantId, minuteWindow));
++                var tpmVal = await db.StringGetAsync(RedisKeys.RateLimitTpm(client.ClientAppId, client.TenantId, minuteWindow));
++                client.CurrentRpm = rpmVal.HasValue ? (long)rpmVal : 0;
++                client.CurrentTpm = tpmVal.HasValue ? (long)tpmVal : 0;
++
++                clients.Add(client);
+             }
+ 
++            logger.LogInformation("Fetched {Count} clients", clients.Count);
+             return Results.Json(new ClientsResponse { Clients = clients }, JsonConfig.Default);
+         }
+         catch (Exception ex)
+@@ -317,8 +284,10 @@ public static class PlanEndpoints
+         string clientAppId,
+         string tenantId,
+         ClientAssignRequest body,
+-        IConnectionMultiplexer redis,
++        IRepository<PlanData> planRepo,
++        IRepository<ClientPlanAssignment> clientRepo,
+         IUsagePolicyStore usagePolicyStore,
++        IConnectionMultiplexer redis,
+         ILogger<ClientPlanAssignment> logger)
+     {
+         try
+@@ -332,14 +301,12 @@ public static class PlanEndpoints
+             if (string.IsNullOrWhiteSpace(body.PlanId))
+                 return Results.BadRequest("planId is required");
+ 
+-            var db = redis.GetDatabase();
+-            var usagePolicy = await usagePolicyStore.GetAsync(db);
+-
+-            var planKey = RedisKeys.Plan(body.PlanId);
+-            if (!await db.KeyExistsAsync(planKey))
++            var plan = await planRepo.GetAsync(body.PlanId);
++            if (plan is null)
+                 return Results.BadRequest($"Plan '{body.PlanId}' does not exist");
+ 
+-            var currentUsage = await ComputeUsage(db, redis, clientAppId, tenantId, logger);
++            var usagePolicy = await usagePolicyStore.GetAsync();
++            var currentUsage = await ComputeUsage(redis, clientAppId, tenantId, logger);
+ 
+             var assignment = new ClientPlanAssignment
+             {
+@@ -354,15 +321,13 @@ public static class PlanEndpoints
+                 LastUpdated = DateTime.UtcNow
+             };
+ 
+-            var cacheKey = RedisKeys.Client(clientAppId, tenantId);
+-            var cacheValue = JsonSerializer.Serialize(assignment, JsonConfig.Default);
+-            await db.StringSetAsync(cacheKey, cacheValue);
++            var persisted = await clientRepo.UpsertAsync(assignment);
+ 
+             logger.LogInformation(
+                 "Client assigned: ClientAppId={ClientAppId}, TenantId={TenantId}, PlanId={PlanId}, Usage={Usage}",
+                 clientAppId, tenantId, body.PlanId, currentUsage);
+ 
+-            return Results.Json(assignment, JsonConfig.Default);
++            return Results.Json(persisted, JsonConfig.Default);
+         }
+         catch (Exception ex)
+         {
+@@ -374,14 +339,13 @@ public static class PlanEndpoints
+     private static async Task<IResult> DeleteClient(
+         string clientAppId,
+         string tenantId,
+-        IConnectionMultiplexer redis,
++        IRepository<ClientPlanAssignment> clientRepo,
+         ILogger<ClientPlanAssignment> logger)
+     {
+         try
+         {
+-            var db = redis.GetDatabase();
+-            var cacheKey = RedisKeys.Client(clientAppId, tenantId);
+-            var deleted = await db.KeyDeleteAsync(cacheKey);
++            var clientId = $"{clientAppId}:{tenantId}";
++            var deleted = await clientRepo.DeleteAsync(clientId);
+ 
+             if (!deleted)
+                 return Results.NotFound(new { error = $"Customer '{clientAppId}/{tenantId}' not found" });
+@@ -401,78 +365,34 @@ public static class PlanEndpoints
+     private static string NormalizePlanName(string name) => name.Trim();
+ 
+     private static async Task<bool> PlanNameExistsAsync(
+-        IDatabase db,
+-        IConnectionMultiplexer redis,
++        IRepository<PlanData> planRepo,
+         string normalizedName,
+-        ILogger logger,
+         string? excludedPlanId = null)
+     {
+-        var planKeys = redis.KeysFromAllServers(RedisKeys.PlanPrefix);
+-        foreach (var planKey in planKeys)
+-        {
+-            var planValue = await db.StringGetAsync(planKey);
+-            if (!planValue.HasValue)
+-                continue;
+-
+-            try
+-            {
+-                var existingPlan = JsonSerializer.Deserialize<PlanData>((string)planValue!, JsonConfig.Default);
+-                if (existingPlan is null)
+-                    continue;
+-
+-                if (!string.IsNullOrWhiteSpace(excludedPlanId) &&
+-                    string.Equals(existingPlan.Id, excludedPlanId, StringComparison.OrdinalIgnoreCase))
+-                    continue;
+-
+-                var existingName = NormalizePlanName(existingPlan.Name);
+-                if (string.Equals(existingName, normalizedName, StringComparison.OrdinalIgnoreCase))
+-                    return true;
+-            }
+-            catch (JsonException ex)
+-            {
+-                logger.LogError(ex, "Failed to deserialize plan data while validating plan name uniqueness for key {Key}", planKey);
+-            }
+-        }
+-
+-        return false;
++        var plans = await planRepo.GetAllAsync();
++        return plans.Any(p =>
++            (!string.IsNullOrWhiteSpace(excludedPlanId)
++                ? !string.Equals(p.Id, excludedPlanId, StringComparison.OrdinalIgnoreCase)
++                : true) &&
++            string.Equals(NormalizePlanName(p.Name), normalizedName, StringComparison.OrdinalIgnoreCase));
+     }
+ 
+     private static async Task<List<string>> GetAssignedClientIdsAsync(
+-        IDatabase db,
+-        IConnectionMultiplexer redis,
+-        string planId,
+-        ILogger logger)
++        IRepository<ClientPlanAssignment> clientRepo,
++        string planId)
+     {
+-        var assignedClientIds = new List<string>();
+-        var clientKeys = redis.KeysFromAllServers(RedisKeys.ClientPrefix);
+-
+-        foreach (var clientKey in clientKeys)
+-        {
+-            var clientValue = await db.StringGetAsync(clientKey);
+-            if (!clientValue.HasValue)
+-                continue;
+-
+-            try
+-            {
+-                var assignment = JsonSerializer.Deserialize<ClientPlanAssignment>((string)clientValue!, JsonConfig.Default);
+-                if (assignment is null)
+-                    continue;
+-
+-                if (string.Equals(assignment.PlanId, planId, StringComparison.Ordinal))
+-                    assignedClientIds.Add(assignment.ClientAppId);
+-            }
+-            catch (JsonException ex)
+-            {
+-                logger.LogError(ex, "Failed to deserialize client assignment while validating plan delete guard for key {Key}", clientKey);
+-            }
+-        }
+-
+-        return assignedClientIds;
++        var clients = await clientRepo.GetAllAsync();
++        return clients
++            .Where(c => string.Equals(c.PlanId, planId, StringComparison.Ordinal))
++            .Select(c => c.ClientAppId)
++            .ToList();
+     }
+ 
+-    private static async Task<long> ComputeUsage(IDatabase db, IConnectionMultiplexer redis, string clientAppId, string tenantId, ILogger logger)
++    private static async Task<long> ComputeUsage(IConnectionMultiplexer redis, string clientAppId, string tenantId, ILogger logger)
+     {
++        // Log data is ephemeral ΓÇö stays Redis-direct
+         long usage = 0;
++        var db = redis.GetDatabase();
+         var logKeys = redis.KeysFromAllServers(RedisKeys.CustomerLogPattern(clientAppId, tenantId));
+ 
+         foreach (var logKey in logKeys)
+diff --git a/src/Chargeback.Api/Endpoints/PrecheckEndpoints.cs b/src/Chargeback.Api/Endpoints/PrecheckEndpoints.cs
+index f173919..39e0689 100644
+--- a/src/Chargeback.Api/Endpoints/PrecheckEndpoints.cs
++++ b/src/Chargeback.Api/Endpoints/PrecheckEndpoints.cs
+@@ -1,3 +1,4 @@
++using System.Collections.Concurrent;
+ using System.Text.Json;
+ using Chargeback.Api.Models;
+ using Chargeback.Api.Services;
+@@ -7,11 +8,16 @@ namespace Chargeback.Api.Endpoints;
+ 
+ public static class PrecheckEndpoints
+ {
++    // In-memory cache for routing policies ΓÇö avoids Redis on every hot-path request.
++    // Key = policyId, Value = (policy, lastRefreshed).
++    private static readonly ConcurrentDictionary<string, (ModelRoutingPolicy Policy, DateTime Loaded)> RoutingPolicyCache = new();
++    private static readonly TimeSpan RoutingPolicyCacheTtl = TimeSpan.FromSeconds(30);
++
+     public static IEndpointRouteBuilder MapPrecheckEndpoints(this IEndpointRouteBuilder routes)
+     {
+         routes.MapGet("/api/precheck/{clientAppId}/{tenantId}", Precheck)
+             .WithName("Precheck")
+-            .WithDescription("Pre-authorize a client+tenant request ΓÇö checks plan, quota, and rate limits")
++            .WithDescription("Pre-authorize a client+tenant request ΓÇö checks plan, quota, rate limits, and model routing")
+             .RequireAuthorization("ApimPolicy");
+         return routes;
+     }
+@@ -20,50 +26,61 @@ public static class PrecheckEndpoints
+         string clientAppId,
+         string tenantId,
+         HttpContext context,
+-        IConnectionMultiplexer redis,
++        IRepository<ClientPlanAssignment> clientRepo,
++        IRepository<PlanData> planRepo,
++        IRepository<ModelRoutingPolicy> routingPolicyRepo,
+         IUsagePolicyStore usagePolicyStore,
++        IConnectionMultiplexer redis,
+         ILogger<PlanData> logger)
+     {
+-        var db = redis.GetDatabase();
+-
+-        // 1. Check client assignment exists
+-        var clientValue = await db.StringGetAsync(RedisKeys.Client(clientAppId, tenantId));
+-        if (!clientValue.HasValue)
++        // 1. Check client assignment exists (reads from Redis cache via CachedRepository)
++        var clientId = $"{clientAppId}:{tenantId}";
++        var assignment = await clientRepo.GetAsync(clientId);
++        if (assignment is null)
+         {
+             return Results.Json(
+                 new { error = "Client not authorized ΓÇö no plan assigned", clientAppId, tenantId },
+                 statusCode: StatusCodes.Status401Unauthorized);
+         }
+ 
+-        var assignment = JsonSerializer.Deserialize<ClientPlanAssignment>((string)clientValue!, JsonConfig.Default);
+-        if (assignment is null)
+-        {
+-            logger.LogError("Invalid client assignment payload for {ClientAppId}/{TenantId}", clientAppId, tenantId);
+-            return Results.Json(
+-                new { error = "Client assignment is invalid", clientAppId, tenantId },
+-                statusCode: StatusCodes.Status500InternalServerError);
+-        }
+-
+-        // 2. Check plan exists
+-        var planValue = await db.StringGetAsync(RedisKeys.Plan(assignment.PlanId));
+-        if (!planValue.HasValue)
++        // 2. Check plan exists (reads from Redis cache via CachedRepository)
++        var plan = await planRepo.GetAsync(assignment.PlanId);
++        if (plan is null)
+         {
+             return Results.Json(
+                 new { error = "Plan configuration not found", planId = assignment.PlanId },
+                 statusCode: StatusCodes.Status500InternalServerError);
+         }
+ 
+-        var plan = JsonSerializer.Deserialize<PlanData>((string)planValue!, JsonConfig.Default);
+-        if (plan is null)
++        // 3. Routing evaluation ΓÇö determine effective deployment
++        var requestedDeploymentId = context.Request.Query["deploymentId"].ToString();
++        string? routedDeploymentId = null;
++        string? routingPolicyId = null;
++
++        var effectivePolicyId = assignment.ModelRoutingPolicyOverride ?? plan.ModelRoutingPolicyId;
++        if (!string.IsNullOrEmpty(effectivePolicyId) && !string.IsNullOrEmpty(requestedDeploymentId))
+         {
+-            logger.LogError("Invalid plan payload for {PlanId}", assignment.PlanId);
+-            return Results.Json(
+-                new { error = "Plan configuration is invalid", planId = assignment.PlanId },
+-                statusCode: StatusCodes.Status500InternalServerError);
++            routingPolicyId = effectivePolicyId;
++            var policy = await GetCachedRoutingPolicy(effectivePolicyId, routingPolicyRepo);
++
++            var routingResult = RoutingEvaluator.Evaluate(requestedDeploymentId, policy);
++
++            if (!routingResult.IsAllowed)
++            {
++                return Results.Json(
++                    new { error = "Deployment denied by routing policy", deploymentId = requestedDeploymentId, routingPolicyId },
++                    statusCode: StatusCodes.Status403Forbidden);
++            }
++
++            if (routingResult.WasRouted)
++                routedDeploymentId = routingResult.DeploymentId;
+         }
+ 
+-        // 3. Check billing period rollover (read-only in precheck to avoid write-side effects)
+-        var usagePolicy = await usagePolicyStore.GetAsync(db);
++        // effectiveDeployment = routed target (if routing changed it), otherwise what was requested
++        var effectiveDeployment = routedDeploymentId ?? requestedDeploymentId;
++
++        // 4. Check billing period rollover (read-only in precheck to avoid write-side effects)
++        var usagePolicy = await usagePolicyStore.GetAsync();
+         var currentDateUtc = DateTime.UtcNow;
+         var expectedPeriodStart = BillingPeriodCalculator.GetCurrentPeriodStartUtc(currentDateUtc, usagePolicy.BillingCycleStartDay);
+         var newBillingPeriod =
+@@ -73,17 +90,16 @@ public static class PrecheckEndpoints
+             ? new Dictionary<string, long>()
+             : assignment.DeploymentUsage;
+ 
+-        // 4. Check quota (with per-deployment support)
++        // 5. Check quota (with per-deployment support) ΓÇö uses effective (routed) deployment
+         if (!plan.RollUpAllDeployments)
+         {
+-            var deploymentId = context.Request.Query["deploymentId"].ToString();
+-            if (!string.IsNullOrEmpty(deploymentId) && plan.DeploymentQuotas.TryGetValue(deploymentId, out var deploymentLimit))
++            if (!string.IsNullOrEmpty(effectiveDeployment) && plan.DeploymentQuotas.TryGetValue(effectiveDeployment, out var deploymentLimit))
+             {
+-                var deploymentUsage = effectiveDeploymentUsage.GetValueOrDefault(deploymentId, 0);
++                var deploymentUsage = effectiveDeploymentUsage.GetValueOrDefault(effectiveDeployment, 0);
+                 if (deploymentUsage >= deploymentLimit && !plan.AllowOverbilling)
+                 {
+                     return Results.Json(
+-                        new { error = "Per-deployment quota exceeded", deploymentId, usage = deploymentUsage, limit = deploymentLimit },
++                        new { error = "Per-deployment quota exceeded", deploymentId = effectiveDeployment, usage = deploymentUsage, limit = deploymentLimit },
+                         statusCode: StatusCodes.Status429TooManyRequests);
+                 }
+             }
+@@ -98,7 +114,8 @@ public static class PrecheckEndpoints
+             }
+         }
+ 
+-        // 5. Check rate limits (atomic increment ΓÇö acts as reservation)
++        // 6. Check rate limits ΓÇö deployment-scoped keys use the ROUTED deployment
++        var db = redis.GetDatabase();
+         var now = DateTimeOffset.UtcNow;
+         var minuteWindow = now.ToUnixTimeSeconds() / 60;
+         long currentRpm = 0;
+@@ -106,7 +123,10 @@ public static class PrecheckEndpoints
+ 
+         if (plan.RequestsPerMinuteLimit > 0)
+         {
+-            var rpmKey = RedisKeys.RateLimitRpm(clientAppId, tenantId, minuteWindow);
++            // Use deployment-scoped key if we have a deployment, else fall back to legacy key
++            var rpmKey = !string.IsNullOrEmpty(effectiveDeployment)
++                ? RedisKeys.RateLimitRpm(clientAppId, tenantId, effectiveDeployment, minuteWindow)
++                : RedisKeys.RateLimitRpm(clientAppId, tenantId, minuteWindow);
+             currentRpm = await db.StringIncrementAsync(rpmKey);
+             if (currentRpm == 1)
+                 await db.KeyExpireAsync(rpmKey, TimeSpan.FromSeconds(120));
+@@ -120,7 +140,9 @@ public static class PrecheckEndpoints
+ 
+         if (plan.TokensPerMinuteLimit > 0)
+         {
+-            var tpmKey = RedisKeys.RateLimitTpm(clientAppId, tenantId, minuteWindow);
++            var tpmKey = !string.IsNullOrEmpty(effectiveDeployment)
++                ? RedisKeys.RateLimitTpm(clientAppId, tenantId, effectiveDeployment, minuteWindow)
++                : RedisKeys.RateLimitTpm(clientAppId, tenantId, minuteWindow);
+             currentTpm = (long)(await db.StringGetAsync(tpmKey));
+             if (currentTpm >= plan.TokensPerMinuteLimit)
+             {
+@@ -130,24 +152,67 @@ public static class PrecheckEndpoints
+             }
+         }
+ 
+-        // 6. Check deployment access control
+-        var accessDeploymentId = context.Request.Query["deploymentId"].ToString();
+-        if (!string.IsNullOrEmpty(accessDeploymentId))
++        // 7. Check deployment access control ΓÇö runs on the ROUTED deployment
++        if (!string.IsNullOrEmpty(effectiveDeployment))
+         {
+-            // Client override takes precedence over plan
+             var effectiveAllowedDeployments = (assignment.AllowedDeployments is { Count: > 0 })
+                 ? assignment.AllowedDeployments
+                 : plan.AllowedDeployments;
+ 
+             if (effectiveAllowedDeployments is { Count: > 0 } &&
+-                !effectiveAllowedDeployments.Contains(accessDeploymentId, StringComparer.OrdinalIgnoreCase))
++                !effectiveAllowedDeployments.Contains(effectiveDeployment, StringComparer.OrdinalIgnoreCase))
+             {
+                 return Results.Json(
+-                    new { error = "Deployment not allowed", deploymentId = accessDeploymentId, allowedDeployments = effectiveAllowedDeployments },
++                    new { error = "Deployment not allowed", deploymentId = effectiveDeployment, allowedDeployments = effectiveAllowedDeployments },
+                     statusCode: StatusCodes.Status403Forbidden);
+             }
+         }
+ 
+-        return Results.Ok(new { status = "authorized", clientAppId, tenantId, plan = plan.Name, usage = effectiveUsage, limit = plan.MonthlyTokenQuota, currentRpm, rpmLimit = plan.RequestsPerMinuteLimit, currentTpm, tpmLimit = plan.TokensPerMinuteLimit });
++        // 8. Return enriched response with routing metadata
++        return Results.Ok(new
++        {
++            status = "authorized",
++            clientAppId,
++            tenantId,
++            plan = plan.Name,
++            usage = effectiveUsage,
++            limit = plan.MonthlyTokenQuota,
++            currentRpm,
++            rpmLimit = plan.RequestsPerMinuteLimit,
++            currentTpm,
++            tpmLimit = plan.TokensPerMinuteLimit,
++            routedDeployment = routedDeploymentId,
++            requestedDeployment = requestedDeploymentId,
++            routingPolicyId
++        });
++    }
++
++    /// <summary>
++    /// Loads a routing policy from in-memory cache, falling back to the repository.
++    /// Cache entries are refreshed every 30 seconds.
++    /// </summary>
++    private static async Task<ModelRoutingPolicy?> GetCachedRoutingPolicy(
++        string policyId, IRepository<ModelRoutingPolicy> routingPolicyRepo)
++    {
++        if (RoutingPolicyCache.TryGetValue(policyId, out var cached) &&
++            DateTime.UtcNow - cached.Loaded < RoutingPolicyCacheTtl)
++        {
++            return cached.Policy;
++        }
++
++        var policy = await routingPolicyRepo.GetAsync(policyId);
++        if (policy is not null)
++        {
++            RoutingPolicyCache[policyId] = (policy, DateTime.UtcNow);
++        }
++        else
++        {
++            RoutingPolicyCache.TryRemove(policyId, out _);
++        }
++
++        return policy;
+     }
++
++    /// <summary>Invalidates the in-memory routing policy cache (for testing).</summary>
++    internal static void ClearRoutingPolicyCache() => RoutingPolicyCache.Clear();
+ }
+diff --git a/src/Chargeback.Api/Endpoints/PricingEndpoints.cs b/src/Chargeback.Api/Endpoints/PricingEndpoints.cs
+index 2e2b080..3ac7728 100644
+--- a/src/Chargeback.Api/Endpoints/PricingEndpoints.cs
++++ b/src/Chargeback.Api/Endpoints/PricingEndpoints.cs
+@@ -1,28 +1,27 @@
+-using System.Text.Json;
+ using Chargeback.Api.Models;
+ using Chargeback.Api.Services;
+-using StackExchange.Redis;
+ 
+ namespace Chargeback.Api.Endpoints;
+ 
+ /// <summary>
+-/// CRUD endpoints for model pricing configuration stored in Redis.
++/// CRUD endpoints for model pricing configuration.
++/// Backed by Cosmos (source of truth) + Redis cache via IRepository.
+ /// </summary>
+ public static class PricingEndpoints
+ {
+     private static readonly Dictionary<string, ModelPricing> DefaultPricing = new()
+     {
+-        ["gpt-5.2"] = new() { ModelId = "gpt-5.2", DisplayName = "GPT-5.2", PromptRatePer1K = 0.03m, CompletionRatePer1K = 0.12m },
+-        ["gpt-5.3-codex"] = new() { ModelId = "gpt-5.3-codex", DisplayName = "GPT-5.3 Codex", PromptRatePer1K = 0.035m, CompletionRatePer1K = 0.14m },
+-        ["gpt-4.1"] = new() { ModelId = "gpt-4.1", DisplayName = "GPT-4.1", PromptRatePer1K = 0.02m, CompletionRatePer1K = 0.08m },
+-        ["gpt-4.1-mini"] = new() { ModelId = "gpt-4.1-mini", DisplayName = "GPT-4.1 Mini", PromptRatePer1K = 0.004m, CompletionRatePer1K = 0.016m },
+-        ["gpt-4.1-nano"] = new() { ModelId = "gpt-4.1-nano", DisplayName = "GPT-4.1 Nano", PromptRatePer1K = 0.001m, CompletionRatePer1K = 0.004m },
+-        ["gpt-4o"] = new() { ModelId = "gpt-4o", DisplayName = "GPT-4o", PromptRatePer1K = 0.03m, CompletionRatePer1K = 0.06m },
+-        ["gpt-4o-mini"] = new() { ModelId = "gpt-4o-mini", DisplayName = "GPT-4o Mini", PromptRatePer1K = 0.005m, CompletionRatePer1K = 0.015m },
+-        ["gpt-4"] = new() { ModelId = "gpt-4", DisplayName = "GPT-4", PromptRatePer1K = 0.02m, CompletionRatePer1K = 0.05m },
+-        ["gpt-oss-120b"] = new() { ModelId = "gpt-oss-120b", DisplayName = "GPT-OSS 120B", PromptRatePer1K = 0.008m, CompletionRatePer1K = 0.032m },
+-        ["text-embedding-3-large"] = new() { ModelId = "text-embedding-3-large", DisplayName = "Text Embedding 3 Large", PromptRatePer1K = 0.001m, CompletionRatePer1K = 0.002m },
+-        ["dall-e-3"] = new() { ModelId = "dall-e-3", DisplayName = "DALL-E 3", ImageRatePer1K = 0.009m },
++        ["gpt-5.2"] = new() { ModelId = "gpt-5.2", DisplayName = "GPT-5.2", PromptRatePer1K = 0.03m, CompletionRatePer1K = 0.12m, Multiplier = 3.0m, TierName = "Premium" },
++        ["gpt-5.3-codex"] = new() { ModelId = "gpt-5.3-codex", DisplayName = "GPT-5.3 Codex", PromptRatePer1K = 0.035m, CompletionRatePer1K = 0.14m, Multiplier = 3.5m, TierName = "Premium" },
++        ["gpt-4.1"] = new() { ModelId = "gpt-4.1", DisplayName = "GPT-4.1", PromptRatePer1K = 0.02m, CompletionRatePer1K = 0.08m, Multiplier = 1.0m, TierName = "Standard" },
++        ["gpt-4.1-mini"] = new() { ModelId = "gpt-4.1-mini", DisplayName = "GPT-4.1 Mini", PromptRatePer1K = 0.004m, CompletionRatePer1K = 0.016m, Multiplier = 0.33m, TierName = "Standard" },
++        ["gpt-4.1-nano"] = new() { ModelId = "gpt-4.1-nano", DisplayName = "GPT-4.1 Nano", PromptRatePer1K = 0.001m, CompletionRatePer1K = 0.004m, Multiplier = 0.1m, TierName = "Economy" },
++        ["gpt-4o"] = new() { ModelId = "gpt-4o", DisplayName = "GPT-4o", PromptRatePer1K = 0.03m, CompletionRatePer1K = 0.06m, Multiplier = 1.0m, TierName = "Standard" },
++        ["gpt-4o-mini"] = new() { ModelId = "gpt-4o-mini", DisplayName = "GPT-4o Mini", PromptRatePer1K = 0.005m, CompletionRatePer1K = 0.015m, Multiplier = 0.33m, TierName = "Standard" },
++        ["gpt-4"] = new() { ModelId = "gpt-4", DisplayName = "GPT-4", PromptRatePer1K = 0.02m, CompletionRatePer1K = 0.05m, Multiplier = 1.0m, TierName = "Standard" },
++        ["gpt-oss-120b"] = new() { ModelId = "gpt-oss-120b", DisplayName = "GPT-OSS 120B", PromptRatePer1K = 0.008m, CompletionRatePer1K = 0.032m, Multiplier = 0.5m, TierName = "Economy" },
++        ["text-embedding-3-large"] = new() { ModelId = "text-embedding-3-large", DisplayName = "Text Embedding 3 Large", PromptRatePer1K = 0.001m, CompletionRatePer1K = 0.002m, Multiplier = 0.1m, TierName = "Economy" },
++        ["dall-e-3"] = new() { ModelId = "dall-e-3", DisplayName = "DALL-E 3", ImageRatePer1K = 0.009m, Multiplier = 2.0m, TierName = "Premium" },
+     };
+ 
+     public static IEndpointRouteBuilder MapPricingEndpoints(this IEndpointRouteBuilder routes)
+@@ -53,49 +52,26 @@ public static class PricingEndpoints
+     }
+ 
+     private static async Task<IResult> GetPricing(
+-        IConnectionMultiplexer redis,
++        IRepository<ModelPricing> pricingRepo,
+         ILogger<ModelPricingResponse> logger)
+     {
+         try
+         {
+-            var db = redis.GetDatabase();
+-            var keys = redis.KeysFromAllServers(RedisKeys.PricingPrefix);
++            var models = await pricingRepo.GetAllAsync();
+ 
+             // Seed defaults on first run
+-            if (keys.Length == 0)
++            if (models.Count == 0)
+             {
+-                logger.LogInformation("No pricing keys found ΓÇö seeding defaults");
+-                foreach (var (modelId, pricing) in DefaultPricing)
++                logger.LogInformation("No pricing found ΓÇö seeding defaults");
++                foreach (var (_, pricing) in DefaultPricing)
+                 {
+                     pricing.UpdatedAt = DateTime.UtcNow;
+-                    var cacheKey = RedisKeys.Pricing(modelId);
+-                    var cacheValue = JsonSerializer.Serialize(pricing, JsonConfig.Default);
+-                    await db.StringSetAsync(cacheKey, cacheValue);
+-                }
+-
+-                keys = redis.KeysFromAllServers(RedisKeys.PricingPrefix);
+-            }
+-
+-            logger.LogInformation("Fetched {KeyCount} pricing keys from Redis", keys.Length);
+-
+-            var models = new List<ModelPricing>();
+-            foreach (var key in keys)
+-            {
+-                var value = await db.StringGetAsync(key);
+-                if (!value.HasValue) continue;
+-
+-                try
+-                {
+-                    var pricing = JsonSerializer.Deserialize<ModelPricing>((string)value!, JsonConfig.Default);
+-                    if (pricing is not null)
+-                        models.Add(pricing);
+-                }
+-                catch (JsonException ex)
+-                {
+-                    logger.LogError(ex, "Failed to deserialize pricing for key {Key}", key);
++                    await pricingRepo.UpsertAsync(pricing);
+                 }
++                models = await pricingRepo.GetAllAsync();
+             }
+ 
++            logger.LogInformation("Fetched {Count} pricing models", models.Count);
+             return Results.Json(new ModelPricingResponse { Models = models }, JsonConfig.Default);
+         }
+         catch (Exception ex)
+@@ -108,7 +84,7 @@ public static class PricingEndpoints
+     private static async Task<IResult> UpsertPricing(
+         string modelId,
+         ModelPricingCreateRequest body,
+-        IConnectionMultiplexer redis,
++        IRepository<ModelPricing> pricingRepo,
+         ILogger<ModelPricing> logger)
+     {
+         try
+@@ -123,16 +99,15 @@ public static class PricingEndpoints
+                 PromptRatePer1K = body.PromptRatePer1K,
+                 CompletionRatePer1K = body.CompletionRatePer1K,
+                 ImageRatePer1K = body.ImageRatePer1K,
++                Multiplier = body.Multiplier ?? 1.0m,
++                TierName = body.TierName ?? "Standard",
+                 UpdatedAt = DateTime.UtcNow
+             };
+ 
+-            var db = redis.GetDatabase();
+-            var cacheKey = RedisKeys.Pricing(modelId);
+-            var cacheValue = JsonSerializer.Serialize(pricing, JsonConfig.Default);
+-            await db.StringSetAsync(cacheKey, cacheValue);
++            var persisted = await pricingRepo.UpsertAsync(pricing);
+ 
+             logger.LogInformation("Pricing upserted: ModelId={ModelId}", modelId);
+-            return Results.Json(pricing, JsonConfig.Default);
++            return Results.Json(persisted, JsonConfig.Default);
+         }
+         catch (Exception ex)
+         {
+@@ -143,14 +118,12 @@ public static class PricingEndpoints
+ 
+     private static async Task<IResult> DeletePricing(
+         string modelId,
+-        IConnectionMultiplexer redis,
++        IRepository<ModelPricing> pricingRepo,
+         ILogger<ModelPricing> logger)
+     {
+         try
+         {
+-            var db = redis.GetDatabase();
+-            var cacheKey = RedisKeys.Pricing(modelId);
+-            var deleted = await db.KeyDeleteAsync(cacheKey);
++            var deleted = await pricingRepo.DeleteAsync(modelId);
+ 
+             if (!deleted)
+                 return Results.NotFound(new { error = $"Pricing for model '{modelId}' not found" });
+diff --git a/src/Chargeback.Api/Endpoints/UsagePolicyEndpoints.cs b/src/Chargeback.Api/Endpoints/UsagePolicyEndpoints.cs
+index 5b6d8c0..74b9660 100644
+--- a/src/Chargeback.Api/Endpoints/UsagePolicyEndpoints.cs
++++ b/src/Chargeback.Api/Endpoints/UsagePolicyEndpoints.cs
+@@ -1,6 +1,5 @@
+ using Chargeback.Api.Models;
+ using Chargeback.Api.Services;
+-using StackExchange.Redis;
+ 
+ namespace Chargeback.Api.Endpoints;
+ 
+@@ -29,14 +28,12 @@ public static class UsagePolicyEndpoints
+     }
+ 
+     private static async Task<IResult> GetUsagePolicy(
+-        IConnectionMultiplexer redis,
+         IUsagePolicyStore usagePolicyStore,
+         ILogger<UsagePolicySettings> logger)
+     {
+         try
+         {
+-            var db = redis.GetDatabase();
+-            var settings = await usagePolicyStore.GetAsync(db);
++            var settings = await usagePolicyStore.GetAsync();
+             return Results.Json(settings, JsonConfig.Default);
+         }
+         catch (Exception ex)
+@@ -48,7 +45,6 @@ public static class UsagePolicyEndpoints
+ 
+     private static async Task<IResult> UpdateUsagePolicy(
+         UsagePolicyUpdateRequest request,
+-        IConnectionMultiplexer redis,
+         IUsagePolicyStore usagePolicyStore,
+         ILogger<UsagePolicySettings> logger)
+     {
+@@ -61,8 +57,7 @@ public static class UsagePolicyEndpoints
+             if (request.TraceRetentionDays is < 1 or > 365)
+                 return Results.BadRequest("traceRetentionDays must be between 1 and 365");
+ 
+-            var db = redis.GetDatabase();
+-            var settings = await usagePolicyStore.UpdateAsync(db, request);
++            var settings = await usagePolicyStore.UpdateAsync(request);
+             return Results.Json(settings, JsonConfig.Default);
+         }
+         catch (Exception ex)
+diff --git a/src/Chargeback.Api/Models/AuditLogDocument.cs b/src/Chargeback.Api/Models/AuditLogDocument.cs
+index ef91dcd..61dfea8 100644
+--- a/src/Chargeback.Api/Models/AuditLogDocument.cs
++++ b/src/Chargeback.Api/Models/AuditLogDocument.cs
+@@ -59,6 +59,26 @@ public sealed class AuditLogDocument
+     [JsonPropertyName("timestamp")]
+     public DateTime Timestamp { get; set; }
+ 
++    /// <summary>Original deployment the client requested (before routing).</summary>
++    [JsonPropertyName("requestedDeploymentId")]
++    public string? RequestedDeploymentId { get; set; }
++
++    /// <summary>Routing policy that was applied (null = no routing).</summary>
++    [JsonPropertyName("routingPolicyId")]
++    public string? RoutingPolicyId { get; set; }
++
++    /// <summary>Per-request billing multiplier applied (null = not using multiplier billing).</summary>
++    [JsonPropertyName("multiplier")]
++    public decimal? Multiplier { get; set; }
++
++    /// <summary>Effective request cost after multiplier (null = not using multiplier billing).</summary>
++    [JsonPropertyName("effectiveRequestCost")]
++    public decimal? EffectiveRequestCost { get; set; }
++
++    /// <summary>Pricing tier name for the deployment/model (null = not using multiplier billing).</summary>
++    [JsonPropertyName("tierName")]
++    public string? TierName { get; set; }
++
+     /// <summary>
+     /// Billing period in YYYY-MM format for efficient querying.
+     /// </summary>
+diff --git a/src/Chargeback.Api/Models/AuditLogItem.cs b/src/Chargeback.Api/Models/AuditLogItem.cs
+index 405a3aa..e97454d 100644
+--- a/src/Chargeback.Api/Models/AuditLogItem.cs
++++ b/src/Chargeback.Api/Models/AuditLogItem.cs
+@@ -20,4 +20,12 @@ public sealed class AuditLogItem
+     public bool IsOverbilled { get; set; }
+     public int StatusCode { get; set; } = 200;
+     public DateTime Timestamp { get; set; }
++
++    // Routing + multiplier billing fields
++    public string? RequestedDeploymentId { get; set; }
++    public string? RoutingPolicyId { get; set; }
++    public decimal? Multiplier { get; set; }
++    public decimal? EffectiveRequestCost { get; set; }
++    public string? TierName { get; set; }
++    public decimal? MultiplierOverageCost { get; set; }
+ }
+diff --git a/src/Chargeback.Api/Models/BillingSummaryDocument.cs b/src/Chargeback.Api/Models/BillingSummaryDocument.cs
+index 803c1e7..a6dcb31 100644
+--- a/src/Chargeback.Api/Models/BillingSummaryDocument.cs
++++ b/src/Chargeback.Api/Models/BillingSummaryDocument.cs
+@@ -70,6 +70,18 @@ public sealed class BillingSummaryDocument
+     [JsonPropertyName("requestCount")]
+     public long RequestCount { get; set; }
+ 
++    /// <summary>Total effective requests (multiplier-weighted) for this period.</summary>
++    [JsonPropertyName("totalEffectiveRequests")]
++    public decimal? TotalEffectiveRequests { get; set; }
++
++    /// <summary>Effective requests broken down by pricing tier.</summary>
++    [JsonPropertyName("effectiveRequestsByTier")]
++    public Dictionary<string, decimal>? EffectiveRequestsByTier { get; set; }
++
++    /// <summary>Total overage cost from multiplier billing for this period.</summary>
++    [JsonPropertyName("multiplierOverageCost")]
++    public decimal? MultiplierOverageCost { get; set; }
++
+     [JsonPropertyName("updatedAt")]
+     public DateTime UpdatedAt { get; set; }
+ 
+diff --git a/src/Chargeback.Api/Models/ClientPlanAssignment.cs b/src/Chargeback.Api/Models/ClientPlanAssignment.cs
+index 2c641c0..0ca2f38 100644
+--- a/src/Chargeback.Api/Models/ClientPlanAssignment.cs
++++ b/src/Chargeback.Api/Models/ClientPlanAssignment.cs
+@@ -7,6 +7,8 @@ namespace Chargeback.Api.Models;
+ /// </summary>
+ public sealed class ClientPlanAssignment
+ {
++    public string Id { get; set; } = string.Empty;
++    public string PartitionKey { get; set; } = "client";
+     public string ClientAppId { get; set; } = string.Empty;
+     public string TenantId { get; set; } = string.Empty;
+     public string PlanId { get; set; } = string.Empty;
+@@ -22,6 +24,18 @@ public sealed class ClientPlanAssignment
+     /// When non-empty, overrides the plan's AllowedDeployments list.</summary>
+     public List<string> AllowedDeployments { get; set; } = [];
+ 
++    /// <summary>Optional routing policy override. Null = inherit from plan.</summary>
++    public string? ModelRoutingPolicyOverride { get; set; }
++
++    /// <summary>Request count for the current billing period (multiplier billing).</summary>
++    public decimal CurrentPeriodRequests { get; set; }
++
++    /// <summary>Requests beyond quota that were overbilled.</summary>
++    public decimal OverbilledRequests { get; set; }
++
++    /// <summary>Request usage broken down by pricing tier for the current period.</summary>
++    public Dictionary<string, decimal> RequestsByTier { get; set; } = new();
++
+     /// <summary>Current requests per minute (populated dynamically, not persisted).</summary>
+     [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingDefault)]
+     public long CurrentRpm { get; set; }
+diff --git a/src/Chargeback.Api/Models/ClientUsageResponse.cs b/src/Chargeback.Api/Models/ClientUsageResponse.cs
+index d6b7497..25bdaa0 100644
+--- a/src/Chargeback.Api/Models/ClientUsageResponse.cs
++++ b/src/Chargeback.Api/Models/ClientUsageResponse.cs
+@@ -10,4 +10,13 @@ public sealed class ClientUsageResponse
+     public long CurrentRpm { get; set; }
+     public decimal TotalCostToUs { get; set; }
+     public decimal TotalCostToCustomer { get; set; }
++
++    // Request-based usage (multiplier billing)
++    public decimal CurrentPeriodRequests { get; set; }
++    public decimal OverbilledRequests { get; set; }
++    public Dictionary<string, decimal> RequestsByTier { get; set; } = new();
++    public decimal MonthlyRequestQuota { get; set; }
++
++    /// <summary>Request utilization percentage (0ΓÇô100). -1 = unlimited quota.</summary>
++    public decimal RequestUtilizationPercent { get; set; }
+ }
+diff --git a/src/Chargeback.Api/Models/ModelPricing.cs b/src/Chargeback.Api/Models/ModelPricing.cs
+index 5f9d40f..3682c01 100644
+--- a/src/Chargeback.Api/Models/ModelPricing.cs
++++ b/src/Chargeback.Api/Models/ModelPricing.cs
+@@ -6,10 +6,19 @@ namespace Chargeback.Api.Models;
+ /// </summary>
+ public sealed class ModelPricing
+ {
++    public string Id { get; set; } = string.Empty;
++    public string PartitionKey { get; set; } = "pricing";
+     public string ModelId { get; set; } = string.Empty;
+     public string DisplayName { get; set; } = string.Empty;
+     public decimal PromptRatePer1K { get; set; }
+     public decimal CompletionRatePer1K { get; set; }
+     public decimal ImageRatePer1K { get; set; }
++
++    /// <summary>Per-request billing multiplier. 1.0 = baseline cost per request.</summary>
++    public decimal Multiplier { get; set; } = 1.0m;
++
++    /// <summary>Display grouping for pricing tiers (e.g. "Standard", "Premium").</summary>
++    public string TierName { get; set; } = "Standard";
++
+     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+ }
+diff --git a/src/Chargeback.Api/Models/ModelPricingCreateRequest.cs b/src/Chargeback.Api/Models/ModelPricingCreateRequest.cs
+index 1def534..eeacf0d 100644
+--- a/src/Chargeback.Api/Models/ModelPricingCreateRequest.cs
++++ b/src/Chargeback.Api/Models/ModelPricingCreateRequest.cs
+@@ -7,4 +7,10 @@ public sealed class ModelPricingCreateRequest
+     public decimal PromptRatePer1K { get; set; }
+     public decimal CompletionRatePer1K { get; set; }
+     public decimal ImageRatePer1K { get; set; }
++
++    /// <summary>Per-request billing multiplier. Null = use default (1.0).</summary>
++    public decimal? Multiplier { get; set; }
++
++    /// <summary>Pricing tier display name. Null = use default ("Standard").</summary>
++    public string? TierName { get; set; }
+ }
+diff --git a/src/Chargeback.Api/Models/PlanCreateRequest.cs b/src/Chargeback.Api/Models/PlanCreateRequest.cs
+index 627e15a..3f73ae2 100644
+--- a/src/Chargeback.Api/Models/PlanCreateRequest.cs
++++ b/src/Chargeback.Api/Models/PlanCreateRequest.cs
+@@ -12,4 +12,16 @@ public sealed class PlanCreateRequest
+     public bool? RollUpAllDeployments { get; set; }
+     public Dictionary<string, long>? DeploymentQuotas { get; set; }
+     public List<string>? AllowedDeployments { get; set; }
++
++    /// <summary>Optional routing policy ID. Null = no model routing.</summary>
++    public string? ModelRoutingPolicyId { get; set; }
++
++    /// <summary>Monthly request quota (0 = unlimited). Used with multiplier billing.</summary>
++    public decimal? MonthlyRequestQuota { get; set; }
++
++    /// <summary>Cost per request when over quota (USD).</summary>
++    public decimal? OverageRatePerRequest { get; set; }
++
++    /// <summary>If true, billing uses per-request multipliers instead of per-token rates.</summary>
++    public bool? UseMultiplierBilling { get; set; }
+ }
+diff --git a/src/Chargeback.Api/Models/PlanData.cs b/src/Chargeback.Api/Models/PlanData.cs
+index 7ce711a..cfb5462 100644
+--- a/src/Chargeback.Api/Models/PlanData.cs
++++ b/src/Chargeback.Api/Models/PlanData.cs
+@@ -7,6 +7,7 @@ namespace Chargeback.Api.Models;
+ public sealed class PlanData
+ {
+     public string Id { get; set; } = string.Empty;
++    public string PartitionKey { get; set; } = "plan";
+     public string Name { get; set; } = string.Empty;
+     
+     /// <summary>Monthly subscription rate in USD.</summary>
+@@ -39,6 +40,18 @@ public sealed class PlanData
+     /// When non-empty, only listed deployments can be accessed by clients on this plan.</summary>
+     public List<string> AllowedDeployments { get; set; } = [];
+ 
++    /// <summary>Optional routing policy ID. Null = no model routing for this plan.</summary>
++    public string? ModelRoutingPolicyId { get; set; }
++
++    /// <summary>Monthly request quota (0 = unlimited). Used with multiplier billing.</summary>
++    public decimal MonthlyRequestQuota { get; set; }
++
++    /// <summary>Cost per request when over quota (USD). 0 = overage not allowed.</summary>
++    public decimal OverageRatePerRequest { get; set; }
++
++    /// <summary>If true, billing uses per-request multipliers instead of per-token rates.</summary>
++    public bool UseMultiplierBilling { get; set; }
++
+     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+ }
+diff --git a/src/Chargeback.Api/Models/PlanUpdateRequest.cs b/src/Chargeback.Api/Models/PlanUpdateRequest.cs
+index 4236a5a..13b8dbd 100644
+--- a/src/Chargeback.Api/Models/PlanUpdateRequest.cs
++++ b/src/Chargeback.Api/Models/PlanUpdateRequest.cs
+@@ -12,4 +12,16 @@ public sealed class PlanUpdateRequest
+     public bool? RollUpAllDeployments { get; set; }
+     public Dictionary<string, long>? DeploymentQuotas { get; set; }
+     public List<string>? AllowedDeployments { get; set; }
++
++    /// <summary>Optional routing policy ID. Null = no change, empty string = clear.</summary>
++    public string? ModelRoutingPolicyId { get; set; }
++
++    /// <summary>Monthly request quota (0 = unlimited).</summary>
++    public decimal? MonthlyRequestQuota { get; set; }
++
++    /// <summary>Cost per request when over quota (USD).</summary>
++    public decimal? OverageRatePerRequest { get; set; }
++
++    /// <summary>If true, billing uses per-request multipliers.</summary>
++    public bool? UseMultiplierBilling { get; set; }
+ }
+diff --git a/src/Chargeback.Api/Models/UsagePolicySettings.cs b/src/Chargeback.Api/Models/UsagePolicySettings.cs
+index d76ad94..9ac1594 100644
+--- a/src/Chargeback.Api/Models/UsagePolicySettings.cs
++++ b/src/Chargeback.Api/Models/UsagePolicySettings.cs
+@@ -6,6 +6,8 @@ namespace Chargeback.Api.Models;
+ /// </summary>
+ public sealed class UsagePolicySettings
+ {
++    public string Id { get; set; } = "usage-policy";
++    public string PartitionKey { get; set; } = "settings";
+     public int BillingCycleStartDay { get; set; } = 1;
+     public int AggregatedLogRetentionDays { get; set; } = 30;
+     public int TraceRetentionDays { get; set; } = 30;
+diff --git a/src/Chargeback.Api/Program.cs b/src/Chargeback.Api/Program.cs
+index f9b6287..a20db85 100644
+--- a/src/Chargeback.Api/Program.cs
++++ b/src/Chargeback.Api/Program.cs
+@@ -46,10 +46,63 @@ configureSettings: settings =>
+ builder.Services.AddSingleton<IChargebackCalculator, ChargebackCalculator>();
+ builder.Services.AddSingleton<ChargebackMetrics>();
+ builder.Services.AddSingleton<ILogDataService, LogDataService>();
+-builder.Services.AddSingleton<IUsagePolicyStore, UsagePolicyStore>();
+ builder.Services.AddSingleton<IAuditStore, AuditStore>();
+ builder.Services.AddSingleton<IDeploymentDiscoveryService, DeploymentDiscoveryService>();
+ 
++// Repository pattern: Cosmos (source of truth) + Redis (cache layer)
++builder.Services.AddSingleton<ConfigurationContainerProvider>();
++builder.Services.AddSingleton<CosmosPlanRepository>();
++builder.Services.AddSingleton<CosmosClientRepository>();
++builder.Services.AddSingleton<CosmosPricingRepository>();
++builder.Services.AddSingleton<CosmosUsagePolicyRepository>();
++builder.Services.AddSingleton<CosmosRoutingPolicyRepository>();
++
++builder.Services.AddSingleton<IRepository<PlanData>>(sp =>
++    new CachedRepository<PlanData>(
++        sp.GetRequiredService<CosmosPlanRepository>(),
++        sp.GetRequiredService<IConnectionMultiplexer>(),
++        id => RedisKeys.Plan(id),
++        entity => entity.Id,
++        sp.GetRequiredService<ILogger<CachedRepository<PlanData>>>()));
++
++builder.Services.AddSingleton<IRepository<ClientPlanAssignment>>(sp =>
++    new CachedRepository<ClientPlanAssignment>(
++        sp.GetRequiredService<CosmosClientRepository>(),
++        sp.GetRequiredService<IConnectionMultiplexer>(),
++        id => $"client:{id}",
++        entity => $"{entity.ClientAppId}:{entity.TenantId}",
++        sp.GetRequiredService<ILogger<CachedRepository<ClientPlanAssignment>>>()));
++
++builder.Services.AddSingleton<IRepository<ModelPricing>>(sp =>
++    new CachedRepository<ModelPricing>(
++        sp.GetRequiredService<CosmosPricingRepository>(),
++        sp.GetRequiredService<IConnectionMultiplexer>(),
++        id => RedisKeys.Pricing(id),
++        entity => entity.ModelId,
++        sp.GetRequiredService<ILogger<CachedRepository<ModelPricing>>>()));
++
++builder.Services.AddSingleton<IRepository<UsagePolicySettings>>(sp =>
++    new CachedRepository<UsagePolicySettings>(
++        sp.GetRequiredService<CosmosUsagePolicyRepository>(),
++        sp.GetRequiredService<IConnectionMultiplexer>(),
++        id => $"settings:{id}",
++        _ => "usage-policy",
++        sp.GetRequiredService<ILogger<CachedRepository<UsagePolicySettings>>>()));
++
++builder.Services.AddSingleton<IRepository<ModelRoutingPolicy>>(sp =>
++    new CachedRepository<ModelRoutingPolicy>(
++        sp.GetRequiredService<CosmosRoutingPolicyRepository>(),
++        sp.GetRequiredService<IConnectionMultiplexer>(),
++        id => RedisKeys.RoutingPolicy(id),
++        entity => entity.Id,
++        sp.GetRequiredService<ILogger<CachedRepository<ModelRoutingPolicy>>>()));
++
++builder.Services.AddSingleton<IUsagePolicyStore, UsagePolicyStore>();
++
++// Startup services: migration first, then cache warming (sequential, blocks app start)
++builder.Services.AddHostedService<RedisToCosmossMigrationService>();
++builder.Services.AddHostedService<CacheWarmingService>();
++
+ // Audit log channel + background writer for batched Cosmos DB writes
+ builder.Services.AddSingleton(Channel.CreateUnbounded<AuditLogItem>(
+     new UnboundedChannelOptions { SingleReader = true }));
+@@ -117,6 +170,8 @@ app.MapPrecheckEndpoints();
+ app.MapPricingEndpoints();
+ app.MapUsagePolicyEndpoints();
+ app.MapDeploymentEndpoints();
++app.MapRoutingPolicyEndpoints();
++app.MapRequestBillingEndpoints();
+ 
+ // SPA client-side routing fallback (anonymous ΓÇö SPA handles its own auth)
+ app.MapFallbackToFile("index.html").AllowAnonymous();
+diff --git a/src/Chargeback.Api/Services/AuditLogWriter.cs b/src/Chargeback.Api/Services/AuditLogWriter.cs
+index 788338b..eee6339 100644
+--- a/src/Chargeback.Api/Services/AuditLogWriter.cs
++++ b/src/Chargeback.Api/Services/AuditLogWriter.cs
+@@ -131,7 +131,12 @@ public sealed class AuditLogWriter : BackgroundService
+             IsOverbilled = item.IsOverbilled,
+             StatusCode = item.StatusCode,
+             Timestamp = item.Timestamp,
+-            BillingPeriod = $"{item.Timestamp:yyyy-MM}"
++            BillingPeriod = $"{item.Timestamp:yyyy-MM}",
++            RequestedDeploymentId = item.RequestedDeploymentId,
++            RoutingPolicyId = item.RoutingPolicyId,
++            Multiplier = item.Multiplier,
++            EffectiveRequestCost = item.EffectiveRequestCost,
++            TierName = item.TierName
+         }).ToList();
+ 
+         for (var attempt = 1; attempt <= MaxRetries; attempt++)
+diff --git a/src/Chargeback.Api/Services/AuditStore.cs b/src/Chargeback.Api/Services/AuditStore.cs
+index 3d61db0..360a8c2 100644
+--- a/src/Chargeback.Api/Services/AuditStore.cs
++++ b/src/Chargeback.Api/Services/AuditStore.cs
+@@ -131,6 +131,23 @@ public sealed class AuditStore : IAuditStore
+                 if (item.IsOverbilled)
+                     summary.IsOverbilled = true;
+ 
++                // Accumulate multiplier billing fields
++                if (item.EffectiveRequestCost.HasValue)
++                {
++                    summary.TotalEffectiveRequests = (summary.TotalEffectiveRequests ?? 0m) + item.EffectiveRequestCost.Value;
++
++                    if (!string.IsNullOrEmpty(item.TierName))
++                    {
++                        summary.EffectiveRequestsByTier ??= new Dictionary<string, decimal>();
++                        if (!summary.EffectiveRequestsByTier.ContainsKey(item.TierName))
++                            summary.EffectiveRequestsByTier[item.TierName] = 0m;
++                        summary.EffectiveRequestsByTier[item.TierName] += item.EffectiveRequestCost.Value;
++                    }
++                }
++
++                if (item.MultiplierOverageCost.HasValue && item.MultiplierOverageCost.Value > 0)
++                    summary.MultiplierOverageCost = (summary.MultiplierOverageCost ?? 0m) + item.MultiplierOverageCost.Value;
++
+                 // Keep display name fresh
+                 if (!string.IsNullOrEmpty(item.DisplayName))
+                     summary.DisplayName = item.DisplayName;
+diff --git a/src/Chargeback.Api/Services/ChargebackCalculator.cs b/src/Chargeback.Api/Services/ChargebackCalculator.cs
+index db3ef28..9f31a0b 100644
+--- a/src/Chargeback.Api/Services/ChargebackCalculator.cs
++++ b/src/Chargeback.Api/Services/ChargebackCalculator.cs
+@@ -43,6 +43,13 @@ public sealed class ChargebackCalculator : IChargebackCalculator
+     // For testing without Redis
+     public ChargebackCalculator() : this(null!, NullLogger<ChargebackCalculator>.Instance) { }
+ 
++    /// <summary>For testing with a pre-seeded pricing cache (no Redis required).</summary>
++    public ChargebackCalculator(Dictionary<string, ModelPricing> pricingCache)
++        : this()
++    {
++        _pricingCache = new Dictionary<string, ModelPricing>(pricingCache, StringComparer.OrdinalIgnoreCase);
++    }
++
+     private async Task RefreshCacheIfNeeded()
+     {
+         if (DateTime.UtcNow - _lastCacheRefresh < CacheRefreshInterval)
+@@ -135,4 +142,60 @@ public sealed class ChargebackCalculator : IChargebackCalculator
+         var overbilledTokens = logData.TotalTokens; // The individual request's tokens (all overbilled)
+         return Math.Round(overbilledTokens / 1_000_000m * plan.CostPerMillionTokens, 4);
+     }
++
++    public decimal CalculateEffectiveRequestCost(CachedLogData logData)
++    {
++        TriggerBackgroundRefresh();
++
++        var key = logData.DeploymentId;
++
++        if (_pricingCache.TryGetValue(key, out var pricing) ||
++            (logData.Model is not null && _pricingCache.TryGetValue(logData.Model, out pricing)))
++        {
++            // Invalid multipliers (zero or negative) default to 1.0
++            return pricing.Multiplier > 0 ? pricing.Multiplier : 1.0m;
++        }
++
++        // Unknown deployment/model ΓÇö default to 1.0
++        return 1.0m;
++    }
++
++    public decimal CalculateMultiplierOverageCost(decimal effectiveCost, decimal currentUsage, PlanData plan)
++    {
++        if (!plan.UseMultiplierBilling) return 0m;
++        if (plan.MonthlyRequestQuota == 0) return 0m; // unlimited
++
++        var totalAfter = currentUsage + effectiveCost;
++        if (totalAfter <= plan.MonthlyRequestQuota) return 0m;
++
++        // Overage is capped at effectiveCost (can't overage more than the current request)
++        var overageUnits = Math.Min(effectiveCost, Math.Max(0m, totalAfter - plan.MonthlyRequestQuota));
++        return Math.Round(overageUnits * plan.OverageRatePerRequest, 4);
++    }
++
++    public string GetTierName(string deploymentId, string? model)
++    {
++        TriggerBackgroundRefresh();
++
++        if (_pricingCache.TryGetValue(deploymentId, out var pricing) ||
++            (model is not null && _pricingCache.TryGetValue(model, out pricing)))
++        {
++            return !string.IsNullOrEmpty(pricing.TierName) ? pricing.TierName : "Standard";
++        }
++
++        return "Standard";
++    }
++
++    public decimal GetMultiplier(string deploymentId, string? model)
++    {
++        TriggerBackgroundRefresh();
++
++        if (_pricingCache.TryGetValue(deploymentId, out var pricing) ||
++            (model is not null && _pricingCache.TryGetValue(model, out pricing)))
++        {
++            return pricing.Multiplier > 0 ? pricing.Multiplier : 1.0m;
++        }
++
++        return 1.0m;
++    }
+ }
+diff --git a/src/Chargeback.Api/Services/IChargebackCalculator.cs b/src/Chargeback.Api/Services/IChargebackCalculator.cs
+index f8cfd6f..63aa5ef 100644
+--- a/src/Chargeback.Api/Services/IChargebackCalculator.cs
++++ b/src/Chargeback.Api/Services/IChargebackCalculator.cs
+@@ -9,4 +9,29 @@ public interface IChargebackCalculator
+ {
+     decimal CalculateCost(CachedLogData logData);
+     decimal CalculateCustomerCost(CachedLogData logData, PlanData plan);
++
++    /// <summary>
++    /// Returns the effective cost of a single request using the model's multiplier.
++    /// Baseline = 1.0. GPT-4.1-mini = 0.33, Premium = 3.0, etc.
++    /// Defaults to 1.0 for unknown models or invalid multipliers (Γëñ0).
++    /// </summary>
++    decimal CalculateEffectiveRequestCost(CachedLogData logData);
++
++    /// <summary>
++    /// Calculates overage cost when a request exceeds the plan's monthly request quota.
++    /// Returns 0 when multiplier billing is disabled or quota is unlimited.
++    /// </summary>
++    decimal CalculateMultiplierOverageCost(decimal effectiveCost, decimal currentUsage, PlanData plan);
++
++    /// <summary>
++    /// Returns the pricing tier name for a deployment/model (e.g., "Standard", "Premium").
++    /// Defaults to "Standard" for unknown deployments.
++    /// </summary>
++    string GetTierName(string deploymentId, string? model);
++
++    /// <summary>
++    /// Returns the raw multiplier value for a deployment/model.
++    /// Defaults to 1.0 for unknown deployments or invalid values (Γëñ0).
++    /// </summary>
++    decimal GetMultiplier(string deploymentId, string? model);
+ }
+diff --git a/src/Chargeback.Api/Services/IUsagePolicyStore.cs b/src/Chargeback.Api/Services/IUsagePolicyStore.cs
+index 896b4ed..eef67e0 100644
+--- a/src/Chargeback.Api/Services/IUsagePolicyStore.cs
++++ b/src/Chargeback.Api/Services/IUsagePolicyStore.cs
+@@ -1,10 +1,9 @@
+ using Chargeback.Api.Models;
+-using StackExchange.Redis;
+ 
+ namespace Chargeback.Api.Services;
+ 
+ public interface IUsagePolicyStore
+ {
+-    Task<UsagePolicySettings> GetAsync(IDatabase db);
+-    Task<UsagePolicySettings> UpdateAsync(IDatabase db, UsagePolicyUpdateRequest request);
++    Task<UsagePolicySettings> GetAsync(CancellationToken ct = default);
++    Task<UsagePolicySettings> UpdateAsync(UsagePolicyUpdateRequest request, CancellationToken ct = default);
+ }
+diff --git a/src/Chargeback.Api/Services/LogDataService.cs b/src/Chargeback.Api/Services/LogDataService.cs
+index 804fb83..9cde8ce 100644
+--- a/src/Chargeback.Api/Services/LogDataService.cs
++++ b/src/Chargeback.Api/Services/LogDataService.cs
+@@ -30,7 +30,7 @@ public sealed class LogDataService : ILogDataService
+     public async Task<List<LogEntry>> GetBillingPeriodSummariesAsync(ILogger logger, CancellationToken ct = default)
+     {
+         var db = _redis.GetDatabase();
+-        var policy = await _usagePolicyStore.GetAsync(db);
++        var policy = await _usagePolicyStore.GetAsync(ct);
+         var periodStart = BillingPeriodCalculator.GetCurrentPeriodStartUtc(DateTime.UtcNow, policy.BillingCycleStartDay);
+ 
+         // Determine which YYYY-MM periods overlap the current billing cycle.
+diff --git a/src/Chargeback.Api/Services/RedisKeys.cs b/src/Chargeback.Api/Services/RedisKeys.cs
+index c21cb9a..d60f6c7 100644
+--- a/src/Chargeback.Api/Services/RedisKeys.cs
++++ b/src/Chargeback.Api/Services/RedisKeys.cs
+@@ -23,6 +23,15 @@ public static class RedisKeys
+     public static string LogEntry(string clientAppId, string tenantId, string deploymentId) => $"log:{clientAppId}:{tenantId}:{deploymentId}";
+     public static string CustomerLogPattern(string clientAppId, string tenantId) => $"log:{clientAppId}:{tenantId}:*";
+ 
++    public static string RoutingPolicy(string policyId) => $"routing-policy:{policyId}";
++    public const string RoutingPolicyPrefix = "routing-policy:*";
++
++    // Deployment-scoped rate limit keys (rate limits apply to routed deployment)
++    public static string RateLimitRpm(string clientAppId, string tenantId, string deploymentId, long minuteWindow)
++        => $"ratelimit:rpm:{clientAppId}:{tenantId}:{deploymentId}:{minuteWindow}";
++    public static string RateLimitTpm(string clientAppId, string tenantId, string deploymentId, long minuteWindow)
++        => $"ratelimit:tpm:{clientAppId}:{tenantId}:{deploymentId}:{minuteWindow}";
++
+     // Key prefix patterns for scanning
+     public const string PlanPrefix = "plan:*";
+     public const string ClientPrefix = "client:*";
+@@ -33,5 +42,5 @@ public static class RedisKeys
+     /// <summary>
+     /// Prefixes used by non-log-entry data types ΓÇö used to filter them out when scanning all keys.
+     /// </summary>
+-    public static readonly string[] ExcludedPrefixes = ["plan:", "client:", "traces:", "pricing:", "ratelimit:", "quota:", "lock:", "settings:"];
++    public static readonly string[] ExcludedPrefixes = ["plan:", "client:", "traces:", "pricing:", "ratelimit:", "quota:", "lock:", "settings:", "routing-policy:"];
+ }
+diff --git a/src/Chargeback.Api/Services/UsagePolicyStore.cs b/src/Chargeback.Api/Services/UsagePolicyStore.cs
+index fc08f0d..ca0bad4 100644
+--- a/src/Chargeback.Api/Services/UsagePolicyStore.cs
++++ b/src/Chargeback.Api/Services/UsagePolicyStore.cs
+@@ -1,43 +1,42 @@
+-using System.Text.Json;
+ using Chargeback.Api.Models;
+-using StackExchange.Redis;
+ 
+ namespace Chargeback.Api.Services;
+ 
+ public sealed class UsagePolicyStore : IUsagePolicyStore
+ {
++    private readonly IRepository<UsagePolicySettings> _repo;
+     private readonly UsagePolicySettings _defaults;
+     private readonly ILogger<UsagePolicyStore> _logger;
+ 
+-    public UsagePolicyStore(IConfiguration configuration, ILogger<UsagePolicyStore> logger)
++    public UsagePolicyStore(
++        IRepository<UsagePolicySettings> repo,
++        IConfiguration configuration,
++        ILogger<UsagePolicyStore> logger)
+     {
++        _repo = repo;
+         _logger = logger;
+         _defaults = Normalize(
+             configuration.GetSection("UsagePolicy").Get<UsagePolicySettings>()
+             ?? new UsagePolicySettings());
+     }
+ 
+-    public async Task<UsagePolicySettings> GetAsync(IDatabase db)
++    public async Task<UsagePolicySettings> GetAsync(CancellationToken ct = default)
+     {
+-        var value = await db.StringGetAsync(RedisKeys.UsagePolicySettings);
+-        if (!value.HasValue)
+-            return Clone(_defaults);
+-
+         try
+         {
+-            var settings = JsonSerializer.Deserialize<UsagePolicySettings>((string)value!, JsonConfig.Default);
+-            return settings is null ? Clone(_defaults) : Normalize(settings);
++            var settings = await _repo.GetAsync("usage-policy", ct);
++            return settings is not null ? Normalize(settings) : Clone(_defaults);
+         }
+-        catch (JsonException ex)
++        catch (Exception ex)
+         {
+-            _logger.LogError(ex, "Failed to deserialize usage policy settings; falling back to defaults");
++            _logger.LogError(ex, "Failed to read usage policy settings; falling back to defaults");
+             return Clone(_defaults);
+         }
+     }
+ 
+-    public async Task<UsagePolicySettings> UpdateAsync(IDatabase db, UsagePolicyUpdateRequest request)
++    public async Task<UsagePolicySettings> UpdateAsync(UsagePolicyUpdateRequest request, CancellationToken ct = default)
+     {
+-        var current = await GetAsync(db);
++        var current = await GetAsync(ct);
+ 
+         if (request.BillingCycleStartDay.HasValue)
+             current.BillingCycleStartDay = request.BillingCycleStartDay.Value;
+@@ -47,8 +46,7 @@ public sealed class UsagePolicyStore : IUsagePolicyStore
+             current.TraceRetentionDays = request.TraceRetentionDays.Value;
+ 
+         var normalized = Normalize(current);
+-        var payload = JsonSerializer.Serialize(normalized, JsonConfig.Default);
+-        await db.StringSetAsync(RedisKeys.UsagePolicySettings, payload);
++        await _repo.UpsertAsync(normalized, ct);
+ 
+         return normalized;
+     }
+diff --git a/src/Chargeback.Tests/ChargebackApiFactory.cs b/src/Chargeback.Tests/ChargebackApiFactory.cs
+index 289a776..6438b04 100644
+--- a/src/Chargeback.Tests/ChargebackApiFactory.cs
++++ b/src/Chargeback.Tests/ChargebackApiFactory.cs
+@@ -1,5 +1,6 @@
+ using System.Security.Claims;
+ using System.Text.Encodings.Web;
++using System.Text.Json;
+ using System.Threading.Channels;
+ using Chargeback.Api.Models;
+ using Chargeback.Api.Services;
+@@ -10,6 +11,7 @@ using Microsoft.AspNetCore.TestHost;
+ using Microsoft.Azure.Cosmos;
+ using Microsoft.Extensions.Configuration;
+ using Microsoft.Extensions.DependencyInjection;
++using Microsoft.Extensions.Hosting;
+ using Microsoft.Extensions.Logging;
+ using Microsoft.Extensions.Options;
+ using NSubstitute;
+@@ -116,6 +118,38 @@ public sealed class ChargebackApiFactory : WebApplicationFactory<Program>
+             AuditStore = mockAuditStore;
+             services.AddSingleton<IAuditStore>(mockAuditStore);
+ 
++            // Remove Cosmos-dependent hosted services (no real Cosmos in tests)
++            RemoveHostedService<RedisToCosmossMigrationService>(services);
++            RemoveHostedService<CacheWarmingService>(services);
++
++            // Replace IRepository<T> with Redis-backed test implementations
++            // so tests that seed FakeRedis directly continue working.
++            RemoveService<IRepository<PlanData>>(services);
++            services.AddSingleton<IRepository<PlanData>>(
++                new RedisBackedRepository<PlanData>(
++                    Redis, id => RedisKeys.Plan(id), e => e.Id, RedisKeys.PlanPrefix));
++
++            RemoveService<IRepository<ClientPlanAssignment>>(services);
++            services.AddSingleton<IRepository<ClientPlanAssignment>>(
++                new RedisBackedRepository<ClientPlanAssignment>(
++                    Redis, id => $"client:{id}",
++                    e => $"{e.ClientAppId}:{e.TenantId}", RedisKeys.ClientPrefix));
++
++            RemoveService<IRepository<ModelPricing>>(services);
++            services.AddSingleton<IRepository<ModelPricing>>(
++                new RedisBackedRepository<ModelPricing>(
++                    Redis, id => RedisKeys.Pricing(id), e => e.ModelId, RedisKeys.PricingPrefix));
++
++            RemoveService<IRepository<UsagePolicySettings>>(services);
++            services.AddSingleton<IRepository<UsagePolicySettings>>(
++                new RedisBackedRepository<UsagePolicySettings>(
++                    Redis, id => $"settings:{id}", _ => "usage-policy", "settings:*"));
++
++            RemoveService<IRepository<ModelRoutingPolicy>>(services);
++            services.AddSingleton<IRepository<ModelRoutingPolicy>>(
++                new RedisBackedRepository<ModelRoutingPolicy>(
++                    Redis, id => RedisKeys.RoutingPolicy(id), e => e.Id, RedisKeys.RoutingPolicyPrefix));
++
+             // Replace authentication with a test handler that auto-authenticates
+             services.AddAuthentication("TestScheme")
+                 .AddScheme<AuthenticationSchemeOptions, TestAuthHandler>("TestScheme", _ => { });
+@@ -136,4 +170,59 @@ public sealed class ChargebackApiFactory : WebApplicationFactory<Program>
+         var descriptors = services.Where(d => d.ServiceType == typeof(T)).ToList();
+         foreach (var d in descriptors) services.Remove(d);
+     }
++
++    private static void RemoveHostedService<T>(IServiceCollection services) where T : class
++    {
++        var descriptors = services.Where(d =>
++            d.ServiceType == typeof(IHostedService) &&
++            (d.ImplementationType == typeof(T) ||
++             d.ImplementationFactory?.Method.ReturnType == typeof(T))).ToList();
++        foreach (var d in descriptors) services.Remove(d);
++    }
++
++    /// <summary>
++    /// IRepository backed directly by FakeRedis for test environments.
++    /// Preserves the pre-migration behavior where endpoints read/wrote Redis directly,
++    /// allowing tests that seed FakeRedis to continue working.
++    /// </summary>
++    private sealed class RedisBackedRepository<T>(
++        FakeRedis redis,
++        Func<string, string> keyFromId,
++        Func<T, string> entityId,
++        string scanPattern) : IRepository<T> where T : class
++    {
++        public async Task<T?> GetAsync(string id, CancellationToken ct = default)
++        {
++            var val = await redis.Database.StringGetAsync(keyFromId(id));
++            if (!val.HasValue) return null;
++            return JsonSerializer.Deserialize<T>((string)val!, JsonConfig.Default);
++        }
++
++        public async Task<List<T>> GetAllAsync(CancellationToken ct = default)
++        {
++            var keys = redis.Multiplexer.KeysFromAllServers(scanPattern);
++            var results = new List<T>();
++            foreach (var key in keys)
++            {
++                var val = await redis.Database.StringGetAsync(key);
++                if (!val.HasValue) continue;
++                var entity = JsonSerializer.Deserialize<T>((string)val!, JsonConfig.Default);
++                if (entity is not null) results.Add(entity);
++            }
++            return results;
++        }
++
++        public async Task<T> UpsertAsync(T entity, CancellationToken ct = default)
++        {
++            var id = entityId(entity);
++            var json = JsonSerializer.Serialize(entity, JsonConfig.Default);
++            await redis.Database.StringSetAsync(keyFromId(id), json);
++            return entity;
++        }
++
++        public async Task<bool> DeleteAsync(string id, CancellationToken ct = default)
++        {
++            return await redis.Database.KeyDeleteAsync(keyFromId(id));
++        }
++    }
+ }
+diff --git a/src/Chargeback.Tests/EndpointTests.cs b/src/Chargeback.Tests/EndpointTests.cs
+index 2010941..a068e75 100644
+--- a/src/Chargeback.Tests/EndpointTests.cs
++++ b/src/Chargeback.Tests/EndpointTests.cs
+@@ -415,7 +415,8 @@ public class EndpointTests : IClassFixture<ChargebackApiFactory>
+         _factory.Redis.SeedString(RedisKeys.Client("bad-client", "tenant-1"), "null");
+ 
+         var response = await _client.PostAsJsonAsync("/api/log", CreateLogRequest("bad-client"), JsonOpts);
+-        Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
++        // With the repository pattern, corrupted data deserializes to null ΓåÆ treated as "client not found" (401)
++        Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+     }
+ 
+     [Fact]
+diff --git a/src/Directory.Packages.props b/src/Directory.Packages.props
+index 72b4260..dda87c0 100644
+--- a/src/Directory.Packages.props
++++ b/src/Directory.Packages.props
+@@ -23,11 +23,11 @@
+     <PackageVersion Include="Microsoft.Extensions.ServiceDiscovery" Version="10.4.0" />
+     <PackageVersion Include="Microsoft.Identity.Client" Version="4.82.1" />
+     <PackageVersion Include="Microsoft.Identity.Web" Version="4.6.0" />
+-    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
++    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.3.0" />
+ 
+     <!-- OpenTelemetry -->
+-    <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.15.0" />
+-    <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.15.0" />
++    <PackageVersion Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.15.1" />
++    <PackageVersion Include="OpenTelemetry.Extensions.Hosting" Version="1.15.1" />
+     <PackageVersion Include="OpenTelemetry.Instrumentation.AspNetCore" Version="1.15.1" />
+     <PackageVersion Include="OpenTelemetry.Instrumentation.Http" Version="1.15.0" />
+     <PackageVersion Include="OpenTelemetry.Instrumentation.Runtime" Version="1.15.0" />
+diff --git a/src/chargeback-ui/src/App.tsx b/src/chargeback-ui/src/App.tsx
+index 664f328..432b875 100644
+--- a/src/chargeback-ui/src/App.tsx
++++ b/src/chargeback-ui/src/App.tsx
+@@ -1,4 +1,4 @@
+-import { useState } from "react"
++import { useState, useEffect, useMemo, useCallback } from "react"
+ import { useIsAuthenticated, useMsal } from "@azure/msal-react"
+ import { InteractionStatus } from "@azure/msal-browser"
+ import { Layout } from "./components/Layout"
+@@ -8,16 +8,44 @@ import { Plans } from "./pages/Plans"
+ import { Pricing } from "./pages/Pricing"
+ import { Export } from "./pages/Export"
+ import { ClientDetail } from "./pages/ClientDetail"
++import { RoutingPolicies } from "./pages/RoutingPolicies"
++import { RequestBilling } from "./pages/RequestBilling"
+ import { loginRequest } from "./auth/msalConfig"
++import { fetchPlans } from "./api"
++import type { PlanDataExtended, BillingMode } from "./types"
+ import { Button } from "./components/ui/button"
+ import { Activity, LogIn } from "lucide-react"
+ 
+ function App() {
+   const [activeTab, setActiveTab] = useState("dashboard")
+   const [selectedClient, setSelectedClient] = useState<{ clientAppId: string; tenantId: string } | null>(null)
++  const [plans, setPlans] = useState<PlanDataExtended[]>([])
+   const isAuthenticated = useIsAuthenticated()
+   const { instance, inProgress } = useMsal()
+ 
++  const loadPlans = useCallback(async () => {
++    try {
++      const res = await fetchPlans()
++      setPlans((res.plans ?? []) as PlanDataExtended[])
++    } catch {
++      // Plans may not be loaded yet ΓÇö billing mode defaults to token
++    }
++  }, [])
++
++  useEffect(() => {
++    if (isAuthenticated) loadPlans()
++  }, [isAuthenticated, loadPlans])
++
++  // Adaptive billing mode
++  const billingMode: BillingMode = useMemo(() => {
++    if (plans.length === 0) return 'token'
++    const hasMultiplier = plans.some(p => p.useMultiplierBilling)
++    const hasToken = plans.some(p => !p.useMultiplierBilling)
++    if (hasMultiplier && hasToken) return 'hybrid'
++    if (hasMultiplier) return 'multiplier'
++    return 'token'
++  }, [plans])
++
+   if (inProgress !== InteractionStatus.None) {
+     return (
+       <div className="flex h-screen items-center justify-center bg-background">
+@@ -49,18 +77,20 @@ function App() {
+ 
+   if (selectedClient) {
+     return (
+-      <Layout activeTab={activeTab} onTabChange={(tab) => { setSelectedClient(null); setActiveTab(tab); }}>
++      <Layout activeTab={activeTab} onTabChange={(tab) => { setSelectedClient(null); setActiveTab(tab); }} billingMode={billingMode}>
+         <ClientDetail clientAppId={selectedClient.clientAppId} tenantId={selectedClient.tenantId} onBack={() => setSelectedClient(null)} />
+       </Layout>
+     )
+   }
+ 
+   return (
+-    <Layout activeTab={activeTab} onTabChange={setActiveTab}>
++    <Layout activeTab={activeTab} onTabChange={setActiveTab} billingMode={billingMode}>
+       {activeTab === "dashboard" && <Dashboard onSelectClient={(clientAppId, tenantId) => setSelectedClient({ clientAppId, tenantId })} />}
+       {activeTab === "clients" && <Clients onSelectClient={(clientAppId, tenantId) => setSelectedClient({ clientAppId, tenantId })} />}
+       {activeTab === "plans" && <Plans />}
+       {activeTab === "pricing" && <Pricing />}
++      {activeTab === "routing" && <RoutingPolicies />}
++      {activeTab === "requests" && <RequestBilling onSelectClient={(clientAppId, tenantId) => setSelectedClient({ clientAppId, tenantId })} />}
+       {activeTab === "export" && <Export />}
+     </Layout>
+   )
+diff --git a/src/chargeback-ui/src/api.ts b/src/chargeback-ui/src/api.ts
+index 2f181ea..2d6c962 100644
+--- a/src/chargeback-ui/src/api.ts
++++ b/src/chargeback-ui/src/api.ts
+@@ -1,6 +1,6 @@
+ import { InteractionRequiredAuthError, PublicClientApplication, type SilentRequest } from "@azure/msal-browser";
+ import { msalConfig, loginRequest } from "./auth/msalConfig";
+-import type { ChargebackResponse, QuotasResponse, QuotaUpdateRequest, QuotaData, PlansResponse, PlanCreateRequest, PlanUpdateRequest, PlanData, ClientsResponse, ClientAssignRequest, ClientUsageResponse, ClientTracesResponse, UsageSummaryResponse, RequestLogsResponse, ModelPricingResponse, ModelPricingCreateRequest, ModelPricing, ExportPeriodsResponse, DeploymentsResponse } from "./types";
++import type { ChargebackResponse, QuotasResponse, QuotaUpdateRequest, QuotaData, PlansResponse, PlanCreateRequest, PlanUpdateRequest, PlanData, ClientsResponse, ClientAssignRequest, ClientUsageResponse, ClientTracesResponse, UsageSummaryResponse, RequestLogsResponse, ModelPricingResponse, ModelPricingCreateRequest, ModelPricing, ExportPeriodsResponse, DeploymentsResponse, RoutingPoliciesResponse, ModelRoutingPolicy, ModelRoutingPolicyCreateRequest, ModelRoutingPolicyUpdateRequest, RequestSummaryResponse } from "./types";
+ 
+ const API_BASE = import.meta.env.VITE_API_URL || "";
+ 
+@@ -237,4 +237,63 @@ async function triggerBlobDownload(res: Response): Promise<void> {
+   URL.revokeObjectURL(url);
+ }
+ 
++// --- Phase 4: Model Routing & Multiplier Billing API ---
++
++export async function fetchRoutingPolicies(): Promise<RoutingPoliciesResponse> {
++  const res = await authFetch(`${API_BASE}/api/routing-policies`);
++  if (!res.ok) throw new Error(`Failed to fetch routing policies: ${res.statusText}`);
++  return res.json();
++}
++
++export async function fetchRoutingPolicy(policyId: string): Promise<ModelRoutingPolicy> {
++  const res = await authFetch(`${API_BASE}/api/routing-policies/${encodeURIComponent(policyId)}`);
++  if (!res.ok) throw new Error(`Failed to fetch routing policy: ${res.statusText}`);
++  return res.json();
++}
++
++export async function createRoutingPolicy(data: ModelRoutingPolicyCreateRequest): Promise<ModelRoutingPolicy> {
++  const res = await authFetch(`${API_BASE}/api/routing-policies`, {
++    method: "POST",
++    body: JSON.stringify(data),
++  });
++  if (!res.ok) throw new Error(`Failed to create routing policy: ${res.statusText}`);
++  return res.json();
++}
++
++export async function updateRoutingPolicy(policyId: string, data: ModelRoutingPolicyUpdateRequest): Promise<ModelRoutingPolicy> {
++  const res = await authFetch(`${API_BASE}/api/routing-policies/${encodeURIComponent(policyId)}`, {
++    method: "PUT",
++    body: JSON.stringify(data),
++  });
++  if (!res.ok) throw new Error(`Failed to update routing policy: ${res.statusText}`);
++  return res.json();
++}
++
++export async function deleteRoutingPolicy(policyId: string): Promise<void> {
++  const res = await authFetch(`${API_BASE}/api/routing-policies/${encodeURIComponent(policyId)}`, {
++    method: "DELETE",
++  });
++  if (!res.ok) throw new Error(`Failed to delete routing policy: ${res.statusText}`);
++}
++
++export async function fetchRequestSummary(year?: number, month?: number): Promise<RequestSummaryResponse> {
++  const params = new URLSearchParams();
++  if (year !== undefined) params.set("year", String(year));
++  if (month !== undefined) params.set("month", String(month));
++  const qs = params.toString();
++  const res = await authFetch(`${API_BASE}/api/chargeback/request-summary${qs ? `?${qs}` : ""}`);
++  if (!res.ok) throw new Error(`Failed to fetch request summary: ${res.statusText}`);
++  return res.json();
++}
++
++export async function downloadRequestBilling(year?: number, month?: number): Promise<void> {
++  const params = new URLSearchParams();
++  if (year !== undefined) params.set("year", String(year));
++  if (month !== undefined) params.set("month", String(month));
++  const qs = params.toString();
++  const res = await authFetch(`${API_BASE}/api/export/request-billing${qs ? `?${qs}` : ""}`);
++  if (!res.ok) throw new Error(`Failed to download request billing: ${res.statusText}`);
++  await triggerBlobDownload(res);
++}
++
+ export { msalInstance, msalReady };
+diff --git a/src/chargeback-ui/src/components/Layout.tsx b/src/chargeback-ui/src/components/Layout.tsx
+index d9cc2a2..42c705b 100644
+--- a/src/chargeback-ui/src/components/Layout.tsx
++++ b/src/chargeback-ui/src/components/Layout.tsx
+@@ -4,14 +4,16 @@ import { useMsal } from "@azure/msal-react"
+ import { useTheme } from "../context/ThemeProvider"
+ import { Button } from "./ui/button"
+ import { DropdownMenu, DropdownMenuItem } from "./ui/dropdown-menu"
++import type { BillingMode } from "../types"
+ 
+ interface LayoutProps {
+   children: ReactNode
+   activeTab: string
+   onTabChange: (tab: string) => void
++  billingMode?: BillingMode
+ }
+ 
+-export function Layout({ children, activeTab, onTabChange }: LayoutProps) {
++export function Layout({ children, activeTab, onTabChange, billingMode = 'token' }: LayoutProps) {
+   const { resolvedTheme, setTheme, theme } = useTheme()
+   const { instance, accounts } = useMsal()
+   const account = accounts[0]
+@@ -21,6 +23,9 @@ export function Layout({ children, activeTab, onTabChange }: LayoutProps) {
+     { id: "clients", label: "Clients" },
+     { id: "plans", label: "Plans" },
+     { id: "pricing", label: "Pricing" },
++    { id: "routing", label: "Routing" },
++    // Adaptive: show Request Billing only when at least one plan uses multiplier billing
++    ...(billingMode !== 'token' ? [{ id: "requests", label: "Request Billing" }] : []),
+     { id: "export", label: "Export" },
+   ]
+ 
+diff --git a/src/chargeback-ui/src/pages/ClientDetail.tsx b/src/chargeback-ui/src/pages/ClientDetail.tsx
+index 9ef28bf..45b8f15 100644
+--- a/src/chargeback-ui/src/pages/ClientDetail.tsx
++++ b/src/chargeback-ui/src/pages/ClientDetail.tsx
+@@ -1,13 +1,13 @@
+ import { useEffect, useState, useCallback } from "react"
+-import { fetchClientUsage, fetchClientTraces } from "../api"
+-import type { ClientUsageResponse, TraceRecord } from "../types"
++import { fetchClientUsage, fetchClientTraces, fetchPlans } from "../api"
++import type { ClientUsageResponse, TraceRecord, PlanDataExtended, ClientAssignmentExtended } from "../types"
+ import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
+ import { Badge } from "../components/ui/badge"
+ import { Button } from "../components/ui/button"
+ import { Progress } from "../components/ui/progress"
+ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table"
+-import { ArrowLeft, DollarSign, TrendingUp, Coins, AlertTriangle, Gauge } from "lucide-react"
+-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell, LineChart, Line, Legend } from "recharts"
++import { ArrowLeft, DollarSign, TrendingUp, Coins, AlertTriangle, Gauge, Zap } from "lucide-react"
++import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell, LineChart, Line, Legend, PieChart, Pie } from "recharts"
+ import { useTheme } from "../context/ThemeProvider"
+ 
+ const BAR_COLORS = ["#0078D4", "#00B7C3", "#107C10", "#FFB900", "#D13438", "#8764B8", "#005A9E", "#106EBE"]
+@@ -21,18 +21,21 @@ interface ClientDetailProps {
+ export function ClientDetail({ clientAppId, tenantId, onBack }: ClientDetailProps) {
+   const [usage, setUsage] = useState<ClientUsageResponse | null>(null)
+   const [traces, setTraces] = useState<TraceRecord[]>([])
++  const [allPlans, setAllPlans] = useState<PlanDataExtended[]>([])
+   const [loading, setLoading] = useState(true)
+   const [error, setError] = useState<string | null>(null)
+   const { resolvedTheme } = useTheme()
+ 
+   const loadData = useCallback(async () => {
+     try {
+-      const [usageRes, tracesRes] = await Promise.all([
++      const [usageRes, tracesRes, plansRes] = await Promise.all([
+         fetchClientUsage(clientAppId, tenantId),
+         fetchClientTraces(clientAppId, tenantId),
++        fetchPlans().catch(() => ({ plans: [] })),
+       ])
+       setUsage(usageRes)
+       setTraces(tracesRes.traces ?? [])
++      setAllPlans((plansRes.plans ?? []) as PlanDataExtended[])
+       setError(null)
+     } catch (err) {
+       setError(err instanceof Error ? err.message : "Failed to load client data")
+@@ -53,6 +56,9 @@ export function ClientDetail({ clientAppId, tenantId, onBack }: ClientDetailProp
+   // Derived values
+   const assignment = usage?.assignment
+   const plan = usage?.plan
++  const extPlan = plan ? allPlans.find(p => p.id === plan.id) ?? plan : null
++  const isMultiplierBilling = (extPlan as PlanDataExtended | null)?.useMultiplierBilling ?? false
++  const extAssignment = assignment as ClientAssignmentExtended | null
+   const quota = plan?.monthlyTokenQuota ?? 0
+   const currentUsage = assignment?.currentPeriodUsage ?? 0
+   const quotaPct = quota > 0 ? (currentUsage / quota) * 100 : 0
+@@ -62,6 +68,18 @@ export function ClientDetail({ clientAppId, tenantId, onBack }: ClientDetailProp
+   const currentTpm = usage?.currentTpm ?? 0
+   const currentRpm = usage?.currentRpm ?? 0
+ 
++  // Request billing derived values
++  const requestQuota = (extPlan as PlanDataExtended | null)?.monthlyRequestQuota ?? 0
++  const currentRequests = extAssignment?.currentPeriodRequests ?? 0
++  const requestPct = requestQuota > 0 ? (currentRequests / requestQuota) * 100 : 0
++  const overbilledRequests = extAssignment?.overbilledRequests ?? 0
++  const requestsByTier = extAssignment?.requestsByTier ?? {}
++
++  const TIER_PIE_COLORS = ["#0078D4", "#FFB900", "#D13438", "#8764B8", "#00B7C3", "#107C10"]
++  const tierChartData = Object.entries(requestsByTier)
++    .filter(([, count]) => count > 0)
++    .map(([tier, count]) => ({ name: tier, value: count }))
++
+   // Chart data
+   const modelChartData = Object.entries(usage?.usageByModel ?? {}).map(([model, tokens]) => ({
+     model,
+@@ -246,6 +264,118 @@ export function ClientDetail({ clientAppId, tenantId, onBack }: ClientDetailProp
+         </Card>
+       </div>
+ 
++      {/* Request Billing Section ΓÇö shown when plan uses multiplier billing */}
++      {isMultiplierBilling && (
++        <div className="space-y-4">
++          <h3 className="text-lg font-semibold flex items-center gap-2">
++            <Zap className="h-5 w-5 text-[#0078D4]" />
++            Request Billing
++          </h3>
++          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
++            <Card>
++              <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
++                <CardTitle className="text-sm font-medium">Request Quota</CardTitle>
++                <Zap className="h-4 w-4 text-[#0078D4]" />
++              </CardHeader>
++              <CardContent>
++                <div className="text-2xl font-bold font-mono">{requestPct.toFixed(1)}%</div>
++                <Progress value={currentRequests} max={requestQuota || 1} className="mt-2" />
++                <p className="text-xs text-muted-foreground mt-1 font-mono">
++                  {currentRequests.toLocaleString()} / {requestQuota.toLocaleString()} requests
++                </p>
++              </CardContent>
++            </Card>
++
++            <Card>
++              <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
++                <CardTitle className="text-sm font-medium">Overbilled Requests</CardTitle>
++                <AlertTriangle className="h-4 w-4 text-[#D13438]" />
++              </CardHeader>
++              <CardContent>
++                <div className="text-2xl font-bold font-mono">{overbilledRequests.toLocaleString()}</div>
++                {overbilledRequests > 0 && <Badge variant="red" className="mt-2">Over Quota</Badge>}
++              </CardContent>
++            </Card>
++
++            {/* Tier Breakdown Pie */}
++            <Card className="md:col-span-2">
++              <CardHeader>
++                <CardTitle className="text-sm font-medium">Requests by Tier</CardTitle>
++              </CardHeader>
++              <CardContent>
++                {tierChartData.length === 0 ? (
++                  <div className="text-center py-4 text-muted-foreground text-sm">No tier data yet.</div>
++                ) : (
++                  <div className="flex items-center gap-4">
++                    <ResponsiveContainer width="50%" height={120}>
++                      <PieChart>
++                        <Pie
++                          data={tierChartData}
++                          cx="50%"
++                          cy="50%"
++                          innerRadius={30}
++                          outerRadius={55}
++                          dataKey="value"
++                          paddingAngle={2}
++                        >
++                          {tierChartData.map((entry, i) => (
++                            <Cell key={entry.name} fill={TIER_PIE_COLORS[i % TIER_PIE_COLORS.length]} />
++                          ))}
++                        </Pie>
++                        <Tooltip />
++                      </PieChart>
++                    </ResponsiveContainer>
++                    <div className="space-y-1">
++                      {tierChartData.map((entry, i) => (
++                        <div key={entry.name} className="flex items-center gap-2 text-sm">
++                          <div
++                            className="h-3 w-3 rounded-full"
++                            style={{ backgroundColor: TIER_PIE_COLORS[i % TIER_PIE_COLORS.length] }}
++                          />
++                          <span>{entry.name}</span>
++                          <span className="font-mono text-muted-foreground">{entry.value.toLocaleString()}</span>
++                        </div>
++                      ))}
++                    </div>
++                  </div>
++                )}
++              </CardContent>
++            </Card>
++          </div>
++
++          {/* Requests by Model Table */}
++          {usage?.usageByModel && Object.keys(usage.usageByModel).length > 0 && (
++            <Card>
++              <CardHeader>
++                <CardTitle className="text-sm font-medium">Requests by Model</CardTitle>
++              </CardHeader>
++              <CardContent>
++                <Table>
++                  <TableHeader>
++                    <TableRow>
++                      <TableHead>Model</TableHead>
++                      <TableHead className="text-right">Requests</TableHead>
++                    </TableRow>
++                  </TableHeader>
++                  <TableBody>
++                    {Object.entries(usage.usageByModel)
++                      .sort(([, a], [, b]) => b - a)
++                      .map(([model, count]) => (
++                        <TableRow key={model}>
++                          <TableCell>
++                            <code className="rounded bg-muted px-2 py-1 text-xs font-mono">{model}</code>
++                          </TableCell>
++                          <TableCell className="text-right font-mono text-sm">{count.toLocaleString()}</TableCell>
++                        </TableRow>
++                      ))}
++                  </TableBody>
++                </Table>
++              </CardContent>
++            </Card>
++          )}
++        </div>
++      )}
++
+       <Card>
+         <CardHeader className="flex flex-row items-center justify-between">
+           <CardTitle className="text-base">Utilization Trend (Last 5 Minutes)</CardTitle>
+diff --git a/src/chargeback-ui/src/pages/Export.tsx b/src/chargeback-ui/src/pages/Export.tsx
+index f93abdd..f2df507 100644
+--- a/src/chargeback-ui/src/pages/Export.tsx
++++ b/src/chargeback-ui/src/pages/Export.tsx
+@@ -1,9 +1,9 @@
+ import { useState, useEffect, useMemo } from "react"
+-import { Download, FileSpreadsheet, AlertTriangle, ClipboardList } from "lucide-react"
++import { Download, FileSpreadsheet, AlertTriangle, ClipboardList, Zap } from "lucide-react"
+ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "../components/ui/card"
+ import { Button } from "../components/ui/button"
+-import { fetchExportPeriods, downloadBillingSummary, downloadClientAudit } from "../api"
+-import type { ExportPeriod, ExportClient } from "../types"
++import { fetchExportPeriods, downloadBillingSummary, downloadClientAudit, downloadRequestBilling, fetchPlans } from "../api"
++import type { ExportPeriod, ExportClient, PlanDataExtended } from "../types"
+ 
+ const MONTH_NAMES = [
+   "January", "February", "March", "April", "May", "June",
+@@ -36,18 +36,28 @@ export function Export() {
+   const [auditPeriod, setAuditPeriod] = useState<string>("")
+   const [auditClient, setAuditClient] = useState<string>("")
+ 
++  // Request billing export state
++  const [requestBillingPeriod, setRequestBillingPeriod] = useState<string>("")
++  const [plans, setPlans] = useState<PlanDataExtended[]>([])
++  const hasMultiplierPlans = plans.some(p => p.useMultiplierBilling)
++
+   useEffect(() => {
+-    fetchExportPeriods()
+-      .then(data => {
++    Promise.all([
++      fetchExportPeriods(),
++      fetchPlans().catch(() => ({ plans: [] })),
++    ])
++      .then(([data, plansRes]) => {
+         setPeriods(data.periods)
+         setCurrentPeriod(data.currentPeriod)
+         setClients(data.clients)
++        setPlans((plansRes.plans ?? []) as PlanDataExtended[])
+         // Default to most recent complete month, or first available
+         const defaultPeriod = data.periods.find(p => !isCurrentMonth(p, data.currentPeriod)) ?? data.periods[0]
+         if (defaultPeriod) {
+           const key = periodKey(defaultPeriod)
+           setSummaryPeriod(key)
+           setAuditPeriod(key)
++          setRequestBillingPeriod(key)
+         }
+         if (data.clients.length > 0) {
+           setAuditClient(`${data.clients[0].clientAppId}|${data.clients[0].tenantId}`)
+@@ -82,6 +92,13 @@ export function Export() {
+   const summaryIsCurrentMonth = selectedSummaryPeriod ? isCurrentMonth(selectedSummaryPeriod, currentPeriod) : false
+   const auditIsCurrentMonth = selectedAuditPeriod ? isCurrentMonth(selectedAuditPeriod, currentPeriod) : false
+ 
++  const selectedRequestBillingPeriod = useMemo(() => {
++    if (!requestBillingPeriod) return null
++    const [y, m] = requestBillingPeriod.split("-").map(Number)
++    return { year: y, month: m } as ExportPeriod
++  }, [requestBillingPeriod])
++  const requestBillingIsCurrentMonth = selectedRequestBillingPeriod ? isCurrentMonth(selectedRequestBillingPeriod, currentPeriod) : false
++
+   const [downloading, setDownloading] = useState(false)
+   const [downloadError, setDownloadError] = useState<string | null>(null)
+ 
+@@ -113,6 +130,19 @@ export function Export() {
+     }
+   }
+ 
++  const handleRequestBillingExport = async () => {
++    if (!selectedRequestBillingPeriod) return
++    setDownloading(true)
++    setDownloadError(null)
++    try {
++      await downloadRequestBilling(selectedRequestBillingPeriod.year, selectedRequestBillingPeriod.month)
++    } catch (err: unknown) {
++      setDownloadError(err instanceof Error ? err.message : "Download failed")
++    } finally {
++      setDownloading(false)
++    }
++  }
++
+   return (
+     <div className="space-y-6">
+       <div className="flex items-center gap-3">
+@@ -259,6 +289,60 @@ export function Export() {
+               </Button>
+             </CardContent>
+           </Card>
++
++          {/* Request Billing Export Card ΓÇö adaptive: only shown when multiplier billing plans exist */}
++          {hasMultiplierPlans && (
++            <Card className="md:col-span-2">
++              <CardHeader>
++                <CardTitle className="text-base flex items-center gap-2">
++                  <Zap className="h-4 w-4" />
++                  Request Billing Export
++                </CardTitle>
++                <CardDescription>
++                  Download a request-based billing report with multiplier costs, effective requests,
++                  and tier breakdowns for all clients using multiplier billing.
++                </CardDescription>
++              </CardHeader>
++              <CardContent className="space-y-4">
++                <div>
++                  <label htmlFor="request-billing-period" className="block text-sm font-medium mb-1">
++                    Billing Period
++                  </label>
++                  <select
++                    id="request-billing-period"
++                    value={requestBillingPeriod}
++                    onChange={e => setRequestBillingPeriod(e.target.value)}
++                    className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
++                  >
++                    {periods.map(p => (
++                      <option key={periodKey(p)} value={periodKey(p)}>
++                        {formatPeriod(p)}
++                        {isCurrentMonth(p, currentPeriod) ? " (current)" : ""}
++                      </option>
++                    ))}
++                  </select>
++                </div>
++
++                {requestBillingIsCurrentMonth && (
++                  <div className="flex items-start gap-2 rounded-md bg-amber-50 p-3 text-amber-800 text-sm">
++                    <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
++                    <span>
++                      Data for {selectedRequestBillingPeriod ? formatPeriod(selectedRequestBillingPeriod) : ""} is incomplete ΓÇö the current month has not ended.
++                    </span>
++                  </div>
++                )}
++
++                <Button
++                  onClick={handleRequestBillingExport}
++                  className="gap-2"
++                  disabled={!selectedRequestBillingPeriod || downloading}
++                >
++                  <Download className="h-4 w-4" />
++                  Export Request Billing
++                </Button>
++              </CardContent>
++            </Card>
++          )}
+         </div>
+       )}
+     </div>
+diff --git a/src/chargeback-ui/src/pages/Plans.tsx b/src/chargeback-ui/src/pages/Plans.tsx
+index 83b03be..7205a21 100644
+--- a/src/chargeback-ui/src/pages/Plans.tsx
++++ b/src/chargeback-ui/src/pages/Plans.tsx
+@@ -1,6 +1,6 @@
+ import { useEffect, useState, useCallback } from "react"
+-import { fetchPlans, createPlan, updatePlan, deletePlan, fetchDeployments } from "../api"
+-import type { PlanData, PlanCreateRequest, DeploymentInfo } from "../types"
++import { fetchPlans, createPlan, updatePlan, deletePlan, fetchDeployments, fetchRoutingPolicies } from "../api"
++import type { PlanCreateRequest, DeploymentInfo, ModelRoutingPolicy, PlanDataExtended } from "../types"
+ import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
+ import { Button } from "../components/ui/button"
+ import { Input } from "../components/ui/input"
+@@ -9,7 +9,14 @@ import { Dialog, DialogHeader, DialogTitle, DialogClose } from "../components/ui
+ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../components/ui/table"
+ import { Pencil, Trash2, Plus, ClipboardList } from "lucide-react"
+ 
+-const emptyPlanForm: PlanCreateRequest = {
++interface PlanFormData extends PlanCreateRequest {
++  modelRoutingPolicyId?: string
++  useMultiplierBilling?: boolean
++  monthlyRequestQuota?: number
++  overageRatePerRequest?: number
++}
++
++const emptyPlanForm: PlanFormData = {
+   name: "",
+   monthlyRate: 0,
+   monthlyTokenQuota: 0,
+@@ -20,18 +27,23 @@ const emptyPlanForm: PlanCreateRequest = {
+   rollUpAllDeployments: true,
+   deploymentQuotas: {},
+   allowedDeployments: [],
++  modelRoutingPolicyId: "",
++  useMultiplierBilling: false,
++  monthlyRequestQuota: 0,
++  overageRatePerRequest: 0,
+ }
+ 
+ export function Plans() {
+-  const [plans, setPlans] = useState<PlanData[]>([])
++  const [plans, setPlans] = useState<PlanDataExtended[]>([])
+   const [availableDeployments, setAvailableDeployments] = useState<DeploymentInfo[]>([])
++  const [routingPolicies, setRoutingPolicies] = useState<ModelRoutingPolicy[]>([])
+   const [loading, setLoading] = useState(true)
+   const [error, setError] = useState<string | null>(null)
+ 
+   // Plan dialog state
+   const [planDialogOpen, setPlanDialogOpen] = useState(false)
+   const [editingPlanId, setEditingPlanId] = useState<string | null>(null)
+-  const [planForm, setPlanForm] = useState<PlanCreateRequest>({ ...emptyPlanForm })
++  const [planForm, setPlanForm] = useState<PlanFormData>({ ...emptyPlanForm })
+   const [saving, setSaving] = useState(false)
+   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null)
+ 
+@@ -41,12 +53,14 @@ export function Plans() {
+ 
+   const loadData = useCallback(async () => {
+     try {
+-      const [plansRes, deploymentsRes] = await Promise.all([
++      const [plansRes, deploymentsRes, policiesRes] = await Promise.all([
+         fetchPlans(),
+         fetchDeployments().catch(() => ({ deployments: [] })),
++        fetchRoutingPolicies().catch(() => ({ policies: [] })),
+       ])
+-      setPlans(plansRes.plans ?? [])
++      setPlans((plansRes.plans ?? []) as PlanDataExtended[])
+       setAvailableDeployments(deploymentsRes.deployments ?? [])
++      setRoutingPolicies(policiesRes.policies ?? [])
+       setError(null)
+     } catch (err) {
+       setError(err instanceof Error ? err.message : "Failed to load data")
+@@ -65,7 +79,7 @@ export function Plans() {
+     setPlanDialogOpen(true)
+   }
+ 
+-  const openEditPlan = (p: PlanData) => {
++  const openEditPlan = (p: PlanDataExtended) => {
+     setEditingPlanId(p.id)
+     setPlanForm({
+       name: p.name,
+@@ -78,13 +92,17 @@ export function Plans() {
+       rollUpAllDeployments: p.rollUpAllDeployments ?? true,
+       deploymentQuotas: p.deploymentQuotas ?? {},
+       allowedDeployments: p.allowedDeployments ?? [],
++      modelRoutingPolicyId: p.modelRoutingPolicyId ?? "",
++      useMultiplierBilling: p.useMultiplierBilling ?? false,
++      monthlyRequestQuota: p.monthlyRequestQuota ?? 0,
++      overageRatePerRequest: p.overageRatePerRequest ?? 0,
+     })
+     setNewDeploymentId("")
+     setNewDeploymentLimit("")
+     setPlanDialogOpen(true)
+   }
+ 
+-  const buildPlanPayload = (): PlanCreateRequest => {
++  const buildPlanPayload = (): PlanFormData => {
+     const rollUpAllDeployments = planForm.rollUpAllDeployments !== false
+     const deploymentQuotas = { ...(planForm.deploymentQuotas ?? {}) }
+     const pendingDeploymentId = newDeploymentId.trim()
+@@ -104,6 +122,10 @@ export function Plans() {
+       rollUpAllDeployments,
+       deploymentQuotas: rollUpAllDeployments ? {} : deploymentQuotas,
+       allowedDeployments: planForm.allowedDeployments ?? [],
++      modelRoutingPolicyId: planForm.modelRoutingPolicyId || undefined,
++      useMultiplierBilling: planForm.useMultiplierBilling ?? false,
++      monthlyRequestQuota: planForm.useMultiplierBilling ? (Number(planForm.monthlyRequestQuota) || 0) : undefined,
++      overageRatePerRequest: planForm.useMultiplierBilling ? (Number(planForm.overageRatePerRequest) || 0) : undefined,
+     }
+   }
+ 
+@@ -147,7 +169,7 @@ export function Plans() {
+     }
+   }
+ 
+-  const updateField = (field: keyof PlanCreateRequest, value: string | boolean) => {
++  const updateField = (field: keyof PlanFormData, value: string | boolean | number) => {
+     setPlanForm((prev) => ({ ...prev, [field]: value }))
+   }
+ 
+@@ -198,6 +220,8 @@ export function Plans() {
+                   <TableHead>Overbilling</TableHead>
+                   <TableHead>Cost/M Tokens</TableHead>
+                   <TableHead>Allowed Deployments</TableHead>
++                  <TableHead>Billing Mode</TableHead>
++                  <TableHead>Routing Policy</TableHead>
+                   <TableHead className="w-[100px]">Actions</TableHead>
+                 </TableRow>
+               </TableHeader>
+@@ -231,6 +255,20 @@ export function Plans() {
+                         </span>
+                       )}
+                     </TableCell>
++                    <TableCell>
++                      <Badge variant={(p as PlanDataExtended).useMultiplierBilling ? "amber" : "blue"}>
++                        {(p as PlanDataExtended).useMultiplierBilling ? "Multiplier" : "Token"}
++                      </Badge>
++                    </TableCell>
++                    <TableCell>
++                      {(p as PlanDataExtended).modelRoutingPolicyId ? (
++                        <Badge variant="teal">
++                          {routingPolicies.find(rp => rp.id === (p as PlanDataExtended).modelRoutingPolicyId)?.name ?? (p as PlanDataExtended).modelRoutingPolicyId}
++                        </Badge>
++                      ) : (
++                        <span className="text-muted-foreground text-xs">None</span>
++                      )}
++                    </TableCell>
+                     <TableCell>
+                       <div className="flex gap-1">
+                         <Button variant="ghost" size="icon" onClick={() => openEditPlan(p)}>
+@@ -304,6 +342,67 @@ export function Plans() {
+             />
+             <label htmlFor="allowOverbilling" className="text-sm font-medium">Allow Overbilling</label>
+           </div>
++
++          {/* Multiplier Billing Toggle */}
++          <div className="space-y-3 rounded border p-3">
++            <div className="flex items-center gap-2">
++              <input
++                type="checkbox"
++                id="useMultiplierBilling"
++                checked={planForm.useMultiplierBilling ?? false}
++                onChange={(e) => updateField("useMultiplierBilling", e.target.checked)}
++                className="h-4 w-4 rounded border-gray-300 accent-[#0078D4]"
++              />
++              <label htmlFor="useMultiplierBilling" className="text-sm font-medium">Use Multiplier Billing</label>
++            </div>
++            <p className="text-xs text-muted-foreground">
++              When enabled, billing uses per-request multipliers instead of per-token costs.
++              Each request's cost = 1 ├ù model multiplier (e.g., GPT-4.1 = 1.0├ù, mini = 0.33├ù).
++            </p>
++            {planForm.useMultiplierBilling && (
++              <div className="grid grid-cols-2 gap-4 mt-2">
++                <div className="space-y-2">
++                  <label className="text-sm font-medium">Monthly Request Quota</label>
++                  <Input
++                    type="number"
++                    min="0"
++                    value={planForm.monthlyRequestQuota ?? 0}
++                    onChange={(e) => updateField("monthlyRequestQuota", e.target.value)}
++                    placeholder="e.g. 10000"
++                  />
++                </div>
++                <div className="space-y-2">
++                  <label className="text-sm font-medium">Overage Rate ($/request)</label>
++                  <Input
++                    type="number"
++                    step="0.001"
++                    min="0"
++                    value={planForm.overageRatePerRequest ?? 0}
++                    onChange={(e) => updateField("overageRatePerRequest", e.target.value)}
++                    placeholder="e.g. 0.01"
++                  />
++                </div>
++              </div>
++            )}
++          </div>
++
++          {/* Routing Policy Selector */}
++          <div className="space-y-2">
++            <label className="text-sm font-medium">Routing Policy</label>
++            <select
++              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
++              value={planForm.modelRoutingPolicyId ?? ""}
++              onChange={(e) => updateField("modelRoutingPolicyId", e.target.value)}
++            >
++              <option value="">None ΓÇö no auto-routing</option>
++              {routingPolicies.map(rp => (
++                <option key={rp.id} value={rp.id}>{rp.name}</option>
++              ))}
++            </select>
++            <p className="text-xs text-muted-foreground">
++              Assign a routing policy to auto-route requests when no deployment is specified.
++            </p>
++          </div>
+           <div className="flex items-center gap-2">
+             <input
+               type="checkbox"
+diff --git a/src/chargeback-ui/src/pages/Pricing.tsx b/src/chargeback-ui/src/pages/Pricing.tsx
+index 58bd675..9cb5115 100644
+--- a/src/chargeback-ui/src/pages/Pricing.tsx
++++ b/src/chargeback-ui/src/pages/Pricing.tsx
+@@ -1,6 +1,6 @@
+ import { useEffect, useState, useCallback } from "react"
+ import { fetchPricing, updatePricing, deletePricing } from "../api"
+-import type { ModelPricing, ModelPricingCreateRequest } from "../types"
++import type { ModelPricingCreateRequest, ModelPricingExtended } from "../types"
+ import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
+ import { Button } from "../components/ui/button"
+ import { Input } from "../components/ui/input"
+@@ -21,7 +21,7 @@ function formatRate(value: number): string {
+ }
+ 
+ export function Pricing() {
+-  const [models, setModels] = useState<ModelPricing[]>([])
++  const [models, setModels] = useState<ModelPricingExtended[]>([])
+   const [loading, setLoading] = useState(true)
+   const [error, setError] = useState<string | null>(null)
+ 
+@@ -29,13 +29,15 @@ export function Pricing() {
+   const [editingModelId, setEditingModelId] = useState<string | null>(null)
+   const [form, setForm] = useState<ModelPricingCreateRequest>({ ...emptyForm })
+   const [displayName, setDisplayName] = useState("")
++  const [multiplier, setMultiplier] = useState(1.0)
++  const [tierName, setTierName] = useState("")
+   const [saving, setSaving] = useState(false)
+   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null)
+ 
+   const loadData = useCallback(async () => {
+     try {
+       const res = await fetchPricing()
+-      setModels(res.models ?? [])
++      setModels((res.models ?? []) as ModelPricingExtended[])
+       setError(null)
+     } catch (err) {
+       setError(err instanceof Error ? err.message : "Failed to load pricing data")
+@@ -50,10 +52,12 @@ export function Pricing() {
+     setEditingModelId(null)
+     setForm({ ...emptyForm })
+     setDisplayName("")
++    setMultiplier(1.0)
++    setTierName("")
+     setDialogOpen(true)
+   }
+ 
+-  const openEdit = (m: ModelPricing) => {
++  const openEdit = (m: ModelPricingExtended) => {
+     setEditingModelId(m.modelId)
+     setForm({
+       modelId: m.modelId,
+@@ -62,15 +66,19 @@ export function Pricing() {
+       imageRatePer1K: m.imageRatePer1K,
+     })
+     setDisplayName(m.displayName ?? "")
++    setMultiplier(m.multiplier ?? 1.0)
++    setTierName(m.tierName ?? "")
+     setDialogOpen(true)
+   }
+ 
+   const handleSave = async () => {
+     setSaving(true)
+     try {
+-      const payload: ModelPricingCreateRequest = {
++      const payload: ModelPricingCreateRequest & { multiplier?: number; tierName?: string } = {
+         ...form,
+         displayName: displayName || undefined,
++        multiplier: multiplier,
++        tierName: tierName || undefined,
+       }
+       const modelId = editingModelId ?? form.modelId
+       await updatePricing(modelId, payload)
+@@ -152,6 +160,8 @@ export function Pricing() {
+                   <TableHead className="text-right">Prompt Rate</TableHead>
+                   <TableHead className="text-right">Completion Rate</TableHead>
+                   <TableHead className="text-right">Image Rate</TableHead>
++                  <TableHead className="text-right">Multiplier</TableHead>
++                  <TableHead>Tier</TableHead>
+                   <TableHead>Last Updated</TableHead>
+                   <TableHead className="text-right">Actions</TableHead>
+                 </TableRow>
+@@ -176,6 +186,22 @@ export function Pricing() {
+                         <span className="text-muted-foreground">ΓÇö</span>
+                       )}
+                     </TableCell>
++                    <TableCell className="text-right font-mono text-sm">
++                      {m.multiplier !== undefined && m.multiplier !== null ? (
++                        <span className={m.multiplier < 1 ? "text-green-600 dark:text-green-400" : m.multiplier > 1 ? "text-amber-600 dark:text-amber-400" : ""}>
++                          {m.multiplier.toFixed(2)}├ù
++                        </span>
++                      ) : (
++                        <span className="text-muted-foreground">1.00├ù</span>
++                      )}
++                    </TableCell>
++                    <TableCell>
++                      {m.tierName ? (
++                        <Badge variant="secondary">{m.tierName}</Badge>
++                      ) : (
++                        <span className="text-muted-foreground text-xs">ΓÇö</span>
++                      )}
++                    </TableCell>
+                     <TableCell className="text-sm text-muted-foreground">
+                       {m.updatedAt ? new Date(m.updatedAt).toLocaleDateString() : "ΓÇö"}
+                     </TableCell>
+@@ -257,6 +283,29 @@ export function Pricing() {
+               />
+             </div>
+           </div>
++          <div className="grid grid-cols-2 gap-4">
++            <div>
++              <label className="text-sm font-medium mb-1 block">Multiplier</label>
++              <Input
++                type="number"
++                step="0.01"
++                min="0"
++                value={multiplier}
++                onChange={(e) => setMultiplier(parseFloat(e.target.value) || 0)}
++              />
++              <p className="text-xs text-muted-foreground mt-1">
++                Cost multiplier per request (1.0 = baseline, 0.33 = 3├ù cheaper)
++              </p>
++            </div>
++            <div>
++              <label className="text-sm font-medium mb-1 block">Tier Name</label>
++              <Input
++                value={tierName}
++                onChange={(e) => setTierName(e.target.value)}
++                placeholder="e.g. Standard, Premium, Ultra"
++              />
++            </div>
++          </div>
+           <div className="flex justify-end gap-2 pt-2">
+             <Button variant="outline" onClick={() => setDialogOpen(false)}>Cancel</Button>
+             <Button onClick={handleSave} disabled={saving || (!editingModelId && !form.modelId)}>
+diff --git a/src/chargeback-ui/src/pages/Quotas.tsx b/src/chargeback-ui/src/pages/Quotas.tsx
+index 3864f21..be6dd07 100644
+--- a/src/chargeback-ui/src/pages/Quotas.tsx
++++ b/src/chargeback-ui/src/pages/Quotas.tsx
+@@ -1,6 +1,6 @@
+ import { useEffect, useState, useCallback } from "react"
+-import { fetchPlans, fetchClients, assignClient, removeClient, fetchDeployments } from "../api"
+-import type { PlanData, ClientAssignment, DeploymentInfo } from "../types"
++import { fetchPlans, fetchClients, assignClient, removeClient, fetchDeployments, fetchRoutingPolicies } from "../api"
++import type { DeploymentInfo, ModelRoutingPolicy, PlanDataExtended, ClientAssignmentExtended } from "../types"
+ import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card"
+ import { Button } from "../components/ui/button"
+ import { Input } from "../components/ui/input"
+@@ -11,9 +11,10 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from ".
+ import { Pencil, Trash2, Plus, Users } from "lucide-react"
+ 
+ export function Clients({ onSelectClient }: { onSelectClient?: (clientAppId: string, tenantId: string) => void }) {
+-  const [plans, setPlans] = useState<PlanData[]>([])
+-  const [clients, setClients] = useState<ClientAssignment[]>([])
++  const [plans, setPlans] = useState<PlanDataExtended[]>([])
++  const [clients, setClients] = useState<ClientAssignmentExtended[]>([])
+   const [availableDeployments, setAvailableDeployments] = useState<DeploymentInfo[]>([])
++  const [routingPolicies, setRoutingPolicies] = useState<ModelRoutingPolicy[]>([])
+   const [loading, setLoading] = useState(true)
+   const [error, setError] = useState<string | null>(null)
+   const [saving, setSaving] = useState(false)
+@@ -27,6 +28,7 @@ export function Clients({ onSelectClient }: { onSelectClient?: (clientAppId: str
+   const [clientPlanId, setClientPlanId] = useState("")
+   const [clientDisplayName, setClientDisplayName] = useState("")
+   const [clientAllowedDeployments, setClientAllowedDeployments] = useState<string[]>([])
++  const [clientRoutingPolicyOverride, setClientRoutingPolicyOverride] = useState("")
+   const [authType, setAuthType] = useState<"key-based" | "entra-id">("entra-id")
+   const [tenantType, setTenantType] = useState<"first-party" | "third-party">("first-party")
+   const [subscriptionName, setSubscriptionName] = useState("")
+@@ -35,14 +37,16 @@ export function Clients({ onSelectClient }: { onSelectClient?: (clientAppId: str
+ 
+   const loadData = useCallback(async () => {
+     try {
+-      const [plansRes, clientsRes, deploymentsRes] = await Promise.all([
++      const [plansRes, clientsRes, deploymentsRes, policiesRes] = await Promise.all([
+         fetchPlans(),
+         fetchClients(),
+         fetchDeployments().catch(() => ({ deployments: [] })),
++        fetchRoutingPolicies().catch(() => ({ policies: [] })),
+       ])
+-      setPlans(plansRes.plans ?? [])
+-      setClients(clientsRes.clients ?? [])
++      setPlans((plansRes.plans ?? []) as PlanDataExtended[])
++      setClients((clientsRes.clients ?? []) as ClientAssignmentExtended[])
+       setAvailableDeployments(deploymentsRes.deployments ?? [])
++      setRoutingPolicies(policiesRes.policies ?? [])
+       setError(null)
+     } catch (err) {
+       setError(err instanceof Error ? err.message : "Failed to load data")
+@@ -60,19 +64,21 @@ export function Clients({ onSelectClient }: { onSelectClient?: (clientAppId: str
+     setClientPlanId(plans.length > 0 ? plans[0].id : "")
+     setClientDisplayName("")
+     setClientAllowedDeployments([])
++    setClientRoutingPolicyOverride("")
+     setAuthType("entra-id")
+     setTenantType("first-party")
+     setSubscriptionName("")
+     setClientDialogOpen(true)
+   }
+ 
+-  const openEditClient = (c: ClientAssignment) => {
++  const openEditClient = (c: ClientAssignmentExtended) => {
+     setEditingClientId({ clientAppId: c.clientAppId, tenantId: c.tenantId })
+     setClientAppIdInput(c.clientAppId)
+     setClientTenantIdInput(c.tenantId)
+     setClientPlanId(c.planId)
+     setClientDisplayName(c.displayName)
+     setClientAllowedDeployments(c.allowedDeployments ?? [])
++    setClientRoutingPolicyOverride(c.modelRoutingPolicyOverride ?? "")
+     if (c.tenantId === "key-based") {
+       setAuthType("key-based")
+       setSubscriptionName(c.clientAppId)
+@@ -175,6 +181,8 @@ export function Clients({ onSelectClient }: { onSelectClient?: (clientAppId: str
+                   <TableHead>Usage</TableHead>
+                   <TableHead>Deployment Usage</TableHead>
+                   <TableHead>Allowed Deployments</TableHead>
++                  <TableHead>Request Usage</TableHead>
++                  <TableHead>Routing Override</TableHead>
+                   <TableHead>Overbilled Tokens</TableHead>
+                   <TableHead className="w-[100px]">Actions</TableHead>
+                 </TableRow>
+@@ -228,6 +236,38 @@ export function Clients({ onSelectClient }: { onSelectClient?: (clientAppId: str
+                           </span>
+                         )}
+                       </TableCell>
++                      <TableCell>
++                        {(plan as PlanDataExtended | undefined)?.useMultiplierBilling ? (
++                          <div className="space-y-1">
++                            <div className="flex items-center gap-2">
++                              <Progress value={c.currentPeriodRequests ?? 0} max={(plan as PlanDataExtended).monthlyRequestQuota || 1} className="w-20" />
++                              <span className="text-xs font-mono">
++                                {(c.currentPeriodRequests ?? 0).toLocaleString()} / {((plan as PlanDataExtended).monthlyRequestQuota ?? 0).toLocaleString()}
++                              </span>
++                            </div>
++                            {c.requestsByTier && Object.keys(c.requestsByTier).length > 0 && (
++                              <div className="flex flex-wrap gap-1">
++                                {Object.entries(c.requestsByTier).map(([tier, count]) => (
++                                  <Badge key={tier} variant="secondary" className="text-xs">
++                                    {tier}: {count.toLocaleString()}
++                                  </Badge>
++                                ))}
++                              </div>
++                            )}
++                          </div>
++                        ) : (
++                          <span className="text-muted-foreground text-xs">Token billing</span>
++                        )}
++                      </TableCell>
++                      <TableCell>
++                        {c.modelRoutingPolicyOverride ? (
++                          <Badge variant="teal">
++                            {routingPolicies.find(rp => rp.id === c.modelRoutingPolicyOverride)?.name ?? c.modelRoutingPolicyOverride}
++                          </Badge>
++                        ) : (
++                          <span className="text-muted-foreground text-xs">Plan default</span>
++                        )}
++                      </TableCell>
+                       <TableCell>
+                         {c.overbilledTokens > 0 ? (
+                           <Badge variant="red">{c.overbilledTokens.toLocaleString()}</Badge>
+@@ -397,6 +437,22 @@ export function Clients({ onSelectClient }: { onSelectClient?: (clientAppId: str
+               </div>
+             )}
+           </div>
++          <div className="space-y-2">
++            <label className="text-sm font-medium">Routing Policy Override</label>
++            <select
++              className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
++              value={clientRoutingPolicyOverride}
++              onChange={(e) => setClientRoutingPolicyOverride(e.target.value)}
++            >
++              <option value="">Inherit from plan</option>
++              {routingPolicies.map(rp => (
++                <option key={rp.id} value={rp.id}>{rp.name}</option>
++              ))}
++            </select>
++            <p className="text-xs text-muted-foreground">
++              Override the plan's routing policy for this client. Leave empty to use the plan default.
++            </p>
++          </div>
+           <div className="flex justify-end gap-2 pt-2">
+             <Button variant="outline" onClick={() => setClientDialogOpen(false)}>Cancel</Button>
+             <Button onClick={handleSaveClient} disabled={saving || (!editingClientId && (authType === "key-based" ? !subscriptionName : (!clientAppIdInput || (tenantType === "third-party" && !clientTenantIdInput)))) || !clientPlanId}>
+diff --git a/src/chargeback-ui/src/types.ts b/src/chargeback-ui/src/types.ts
+index dcb2732..1aae62d 100644
+--- a/src/chargeback-ui/src/types.ts
++++ b/src/chargeback-ui/src/types.ts
+@@ -213,3 +213,96 @@ export interface DeploymentInfo {
+ export interface DeploymentsResponse {
+   deployments: DeploymentInfo[];
+ }
++
++// --- Phase 4: Model Routing & Multiplier Billing ---
++
++export type RoutingBehavior = 'Passthrough' | 'Deny';
++
++export interface RouteRule {
++  requestedDeployment: string;
++  routedDeployment: string;
++}
++
++export interface ModelRoutingPolicy {
++  id: string;
++  name: string;
++  description?: string;
++  defaultBehavior: RoutingBehavior;
++  fallbackDeployment?: string;
++  rules: RouteRule[];
++  createdAt: string;
++  updatedAt: string;
++}
++
++export interface ModelRoutingPolicyCreateRequest {
++  name: string;
++  description?: string;
++  defaultBehavior: RoutingBehavior;
++  fallbackDeployment?: string;
++  rules: RouteRule[];
++}
++
++export interface ModelRoutingPolicyUpdateRequest {
++  name?: string;
++  description?: string;
++  defaultBehavior?: RoutingBehavior;
++  fallbackDeployment?: string;
++  rules?: RouteRule[];
++}
++
++export interface RoutingPoliciesResponse {
++  policies: ModelRoutingPolicy[];
++}
++
++// Extended plan fields for multiplier billing
++export interface PlanDataExtended extends PlanData {
++  modelRoutingPolicyId?: string;
++  monthlyRequestQuota?: number;
++  overageRatePerRequest?: number;
++  useMultiplierBilling?: boolean;
++}
++
++// Extended client assignment for request-based billing
++export interface ClientAssignmentExtended extends ClientAssignment {
++  modelRoutingPolicyOverride?: string;
++  currentPeriodRequests?: number;
++  overbilledRequests?: number;
++  requestsByTier?: Record<string, number>;
++  requestUtilizationPercent?: number;
++}
++
++// Extended model pricing with multiplier fields
++export interface ModelPricingExtended extends ModelPricing {
++  multiplier?: number;
++  tierName?: string;
++}
++
++// Request summary types
++export interface RequestClientSummary {
++  clientAppId: string;
++  tenantId: string;
++  displayName: string;
++  planName: string;
++  totalRequests: number;
++  effectiveRequests: number;
++  monthlyQuota: number;
++  utilizationPercent: number;
++  overbilledRequests: number;
++  requestsByTier: Record<string, number>;
++  requestsByModel: Record<string, number>;
++}
++
++export interface RequestSummaryTotals {
++  totalRequests: number;
++  totalEffectiveRequests: number;
++  totalOverbilledRequests: number;
++  requestsByTier: Record<string, number>;
++}
++
++export interface RequestSummaryResponse {
++  billingPeriod: { year: number; month: number };
++  clients: RequestClientSummary[];
++  totals: RequestSummaryTotals;
++}
++
++export type BillingMode = 'token' | 'multiplier' | 'hybrid';

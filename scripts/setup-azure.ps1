@@ -702,10 +702,7 @@ if ($SkipBicep) {
     Write-Host ""
 } else {
     try {
-        Write-Host "  Retrieving ACR credentials..." -ForegroundColor Gray
-        $acrPassword = az acr credential show --name $AcrName --query "passwords[0].value" -o tsv
-        if ($LASTEXITCODE -ne 0) { throw "Failed to get ACR credentials." }
-        Write-Host "    ✓ ACR credentials retrieved" -ForegroundColor Green
+        Write-Host "  ACR managed identity pull configured — no admin credentials needed." -ForegroundColor Gray
 
         Write-Host "  Checking soft-deleted resource collisions..." -ForegroundColor Gray
         $deletedApim = az apim deletedservice list --query "[?name=='$ApimName'] | [0].name" -o tsv 2>$null
@@ -780,8 +777,7 @@ if ($SkipBicep) {
                 containerAppEnvName=$ContainerAppEnvName `
                 containerImage=$imageTag `
                 acrLoginServer="$($AcrName).azurecr.io" `
-                acrUsername=$AcrName `
-                acrPassword=$acrPassword `
+                acrName=$AcrName `
                 oaiApiName="azure-openai-api" `
                 funcApiName="chargeback-api" `
                 enableJwt=$($EnableJwt.ToString().ToLower()) `

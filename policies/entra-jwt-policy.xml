@@ -120,6 +120,8 @@
 		<!-- Extract routedDeployment from the precheck 200 response (null-safe) -->
 		<set-variable name="routedDeployment"
 			value="@(((IResponse)context.Variables["precheckResponse"]).Body.As<JObject>(preserveContent: true)["routedDeployment"]?.ToString())" />
+		<set-variable name="routingPolicyId"
+			value="@(((IResponse)context.Variables["precheckResponse"]).Body.As<JObject>(preserveContent: true)["routingPolicyId"]?.ToString())" />
 		<!-- If routing produced a different deployment, rewrite the backend URL path -->
 		<choose>
 			<when condition="@(!string.IsNullOrEmpty((string)context.Variables["routedDeployment"]) &amp;&amp; (string)context.Variables["routedDeployment"] != (string)context.Variables["deploymentId"])">
@@ -168,9 +170,8 @@
             string txt = (string)context.Variables["responseBodyText"];
             if (txt.TrimStart().StartsWith("data:")) {
                 var lines = txt.Split(new[] {'\n', '\r'}, StringSplitOptions.RemoveEmptyEntries);
-                // Get the last line starting with 'data:' that contains a JSON part and is not the '[DONE]' marker
                 var chunkLine = lines
-                    .Where(l => l.Trim().StartsWith("data:") && l.Contains("{") && !l.Contains("[DONE]"))
+                    .Where(l => l.Trim().StartsWith("data:") && l.Contains("\"usage\"") && !l.Contains("[DONE]"))
                     .LastOrDefault();
                 if (chunkLine != null) {
                     int index = chunkLine.IndexOf('{');
@@ -199,19 +200,24 @@
 				<value>@("Bearer " + (string)context.Variables["msi-access-token"])</value>
 			</set-header>
 			<set-body>@{
-				var requestBody = context.Variables.GetValueOrDefault<string>("requestBody");
+				var requestBodyRaw = context.Variables.GetValueOrDefault<string>("requestBody");
 				var parsedResponseString = context.Variables.GetValueOrDefault<string>("parsedResponseString");
-				var tenantId = context.Variables.GetValueOrDefault<string>("tenantId");
-				var clientAppId = context.Variables.GetValueOrDefault<string>("clientAppId");
-				var audience = context.Variables.GetValueOrDefault<string>("audience");
 				var deploymentId = context.Variables.GetValueOrDefault<string>("deploymentId");
-				// Auto-router fields: requestedDeploymentId is the client's original ask,
-				// routedDeployment is what precheck recommended (may be empty if no routing).
 				var requestedDeploymentId = context.Variables.ContainsKey("originalDeploymentId")
 					? context.Variables.GetValueOrDefault<string>("originalDeploymentId")
 					: deploymentId;
-				var routedDeployment = context.Variables.GetValueOrDefault<string>("routedDeployment") ?? "";
-				return $"{{\"tenantId\": \"{tenantId}\", \"clientAppId\": \"{clientAppId}\", \"audience\": \"{audience}\", \"requestBody\": {requestBody}, \"responseBody\": {parsedResponseString}, \"deploymentId\": \"{deploymentId}\", \"requestedDeploymentId\": \"{requestedDeploymentId}\", \"routedDeployment\": \"{routedDeployment}\"}}";
+				var payload = new JObject {
+					["tenantId"] = (string)context.Variables.GetValueOrDefault("tenantId", ""),
+					["clientAppId"] = (string)context.Variables.GetValueOrDefault("clientAppId", ""),
+					["audience"] = (string)context.Variables.GetValueOrDefault("audience", ""),
+					["requestBody"] = !string.IsNullOrEmpty(requestBodyRaw) ? JToken.Parse(requestBodyRaw) : null,
+					["responseBody"] = !string.IsNullOrEmpty(parsedResponseString) ? JToken.Parse(parsedResponseString) : null,
+					["deploymentId"] = deploymentId ?? "",
+					["requestedDeploymentId"] = requestedDeploymentId ?? "",
+					["routedDeployment"] = context.Variables.GetValueOrDefault<string>("routedDeployment") ?? "",
+					["routingPolicyId"] = context.Variables.GetValueOrDefault<string>("routingPolicyId") ?? ""
+				};
+				return payload.ToString();
 			}</set-body>
 		</send-one-way-request>
 	</outbound>

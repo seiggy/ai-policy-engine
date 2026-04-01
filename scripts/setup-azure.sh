@@ -673,10 +673,7 @@ if [[ "$SKIP_BICEP" == "true" ]]; then
     echo -e "  ${GRAY}  ⊘ Bicep deployment skipped (--skip-bicep)${NC}"
     echo ""
 else
-    info "Retrieving ACR credentials..."
-    acr_password=$(az acr credential show --name "$ACR_NAME" --query "passwords[0].value" -o tsv) \
-        || die "Failed to get ACR credentials."
-    success "ACR credentials retrieved"
+    info "ACR managed identity pull configured — no admin credentials needed."
 
     info "Checking soft-deleted resource collisions..."
     deleted_apim=$(az apim deletedservice list --query "[?name=='$APIM_NAME'] | [0].name" -o tsv 2>/dev/null) || true
@@ -745,8 +742,7 @@ else
             containerAppEnvName="$CONTAINER_APP_ENV_NAME" \
             containerImage="$image_tag" \
             acrLoginServer="${ACR_NAME}.azurecr.io" \
-            acrUsername="$ACR_NAME" \
-            acrPassword="$acr_password" \
+            acrName="$ACR_NAME" \
             oaiApiName="azure-openai-api" \
             funcApiName="chargeback-api" \
             enableJwt="$ENABLE_JWT" \
