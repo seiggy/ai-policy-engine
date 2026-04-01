@@ -65,3 +65,65 @@ Backend storage architecture, model routing, and multiplier pricing are complete
 
 **Test Results:** 200/200 tests pass (30 new Phase 2 integration tests from Bunk B5.7 + B5.8).
 
+### 2026-03-31 — Phase 4 Complete: Frontend UI for Routing & Multiplier Billing
+
+**Phase 4 Status:** ✅ COMPLETE (Kima K4.1–K4.9)
+
+All frontend work for model routing policies and multiplier billing is implemented. Build passes, lint clean (no new issues).
+
+**What Was Built:**
+
+- **K4.8 — TypeScript types:** `ModelRoutingPolicy`, `RouteRule`, `RoutingBehavior`, `PlanDataExtended`, `ClientAssignmentExtended`, `ModelPricingExtended`, `RequestSummaryResponse`, `BillingMode` in `types.ts`
+- **K4.9 — API client:** CRUD for routing policies, request summary fetch, request billing export download in `api.ts`
+- **K4.1 — Routing Policies page:** Full CRUD with rule builder (deployment picker or manual input), default behavior selector, fallback deployment, "used by plans" indicator, delete warning
+- **K4.2 — Plans page extended:** Routing policy selector, UseMultiplierBilling toggle, MonthlyRequestQuota/OverageRatePerRequest fields (conditionally visible), Billing Mode and Routing Policy columns in table
+- **K4.3 — Clients page extended:** Routing policy override selector, effective request usage display with progress bar + tier breakdown badges, routing override column in table
+- **K4.4 — Pricing page extended:** Multiplier column (color-coded: green < 1.0, amber > 1.0), TierName column with badges, multiplier/tier fields in create/edit dialog
+- **K4.5 — Request Billing dashboard:** KPI cards (total/effective/overbilled/active clients), bar chart by client, donut chart by tier, overage alerts with progress bars, per-client summary table. Adaptive: only visible when multiplier billing plans exist
+- **K4.6 — Client detail extended:** Request billing section with quota gauge, overbilled requests card, tier pie chart, requests-by-model table. Only shown when client's plan uses multiplier billing
+- **K4.7 — Export page extended:** Request Billing Export card with period selector. Adaptive: only visible when multiplier billing plans exist
+
+**Adaptive UI Logic (per Zack's directive):**
+- `BillingMode` type: `'token' | 'multiplier' | 'hybrid'`
+- App.tsx computes billing mode from plan data, passes to Layout
+- Layout conditionally shows "Request Billing" nav tab
+- RequestBilling page shows empty state when no multiplier plans
+- Export shows request billing card only when multiplier plans exist
+- ClientDetail shows request billing section only for multiplier-billed plans
+
+**Architecture Decisions:**
+- Extended existing types with `PlanDataExtended`, `ClientAssignmentExtended`, `ModelPricingExtended` to avoid breaking existing code
+- No new dependencies — reused Recharts, Lucide, Tailwind, existing component library
+- Followed existing patterns: `useCallback` data loading, `authFetch` wrapper, Card/Table/Badge/Dialog components
+- Routing Policies is always visible (routing is useful regardless of billing mode)
+
+**Build Results:** `tsc -b && vite build` succeeds. Lint: 9 pre-existing errors, 0 new.
+
+### 2026-03-31 — Session Complete: All 5 Phases Delivered
+
+**Project Status:** ✅ COMPLETE
+
+All work is done. Phase 0 (storage), Phase 1 (routing + pricing), Phase 2 (enforcement), Phase 3 (APIM policies), Phase 4 (frontend UI), Phase 5 (testing) all complete. 222 tests passing. Full end-to-end system operational.
+
+**Kima's Contributions:**
+- Phase 4 (K4.1–K4.9): Frontend UI for model routing policies and multiplier billing, adaptive billing dashboards, routing policy CRUD page, request billing exports
+
+**What's Ready for Deployment:**
+- React frontend with all routing and billing UI components
+- Adaptive UI logic: billing mode computed from plan configuration (token/multiplier/hybrid)
+- Full CRUD for routing policies, detailed client billing views, tier-based analytics
+- Integration with all backend API endpoints
+- TypeScript strict mode compliant, no new linting issues
+
+**User Experience:**
+- Dashboard auto-adapts based on billing configuration
+- Routing policies fully manageable from UI
+- Request billing tracking with per-client, per-tier analytics
+- Export functionality for billing data
+
+**Next Phase (Future):**
+- Advanced policy engine UI for enforced model rewrites
+- Custom dashboard builder
+- Audit log UI for policy change history
+
+

@@ -70,6 +70,18 @@ This applies to dashboards, usage views, client detail pages, and export options
 **Implementation:** Option A (strict). `RoutingPolicyEndpoints.ValidateDeployments` rejects empty deployment sets per `RoutingPolicyValidator` service logic. Prevents phantom deployment references. Found and validated by Bunk during B5.6 test writing.  
 **Phase:** 2 (enforcement) — validation now strictly enforced in PrecheckEndpoints routing evaluation.
 
+### 2026-03-31T16:40:00Z: Model routing is auto-router, not enforced rewrite (initial scope) (ACCEPTED)
+**By:** Zack Way (via Copilot)  
+**Status:** Accepted  
+**What:** The initial model routing feature is an AUTO-ROUTER, not enforced model rewriting:
+1. Users send requests WITHOUT a model/deployment specified → system picks the deployment based on their plan's routing policy
+2. Fallback routing if a model is unavailable (future — needs health checks, not yet built)
+3. NOT about forcing users to a different model than what they requested. If they ask for GPT-4, they get GPT-4.
+4. Enforced rewrite (redirect GPT-4 → GPT-4o-mini based on policy) is a FUTURE policy engine feature — there's a whole policy engine to build for that.
+5. Load-based routing to PTUs is tabled for now.
+6. The APIM architecture (precheck returns routedDeployment, APIM applies it) is correct — it's the necessary plumbing. But the initial implementation should be auto-routing, not rewrite enforcement.
+**Why:** User scope clarification — defines the boundary between initial routing feature and future policy engine work.
+
 ## Governance
 
 - All meaningful changes require team consensus
