@@ -94,6 +94,25 @@ This applies to dashboards, usage views, client detail pages, and export options
 **Architecture Impact:** No architectural changes — all fixes are bug corrections and code cleanup.
 **Decision:** APPROVED FOR MERGE. Deploy backend + frontend together. Schedule N1–N5 for next sprint.
 
+### 2026-04-01T17:52:00Z: Re-Review Verdict — All 11 Findings Verified (APPROVED FOR DEPLOYMENT)
+**By:** McNulty (Lead / Architect)  
+**Status:** Approved  
+**What:** Independent re-review of all 11 code review fixes. All blockers, should-fixes, and nice-to-haves verified:
+- **B1 (Precheck Quota Enforcement):** ✅ FIXED. `PrecheckEndpoints.cs` lines 117–127 correctly check `UseMultiplierBilling && MonthlyRequestQuota > 0`, compute `effectiveRequests`, return 429 when quota exceeded. Positioned after token quota check.
+- **B2 (BillingPeriod Type):** ✅ FIXED. `types.ts` line 303 defines `billingPeriod: string` with correct format. `RequestBilling.tsx` line 126 renders as plain string. No property access errors.
+- **B3 (RouteRule Fields):** ✅ FIXED. `types.ts` lines 245–246 defines `priority: number` and `enabled: boolean`. `RoutingPolicies.tsx` includes editable inputs (priority lines 350–359, enabled lines 336–345).
+- **S1 (Dead Code Cleanup):** ✅ FIXED. `Repositories/` directory removed, zero namespace references remain.
+- **S2 (JSON Injection Prevention):** ✅ FIXED. Both APIM policies use `JObject` construction, no string interpolation of user values.
+- **S3 (Race Condition Fix):** ✅ FIXED. `ConfigurationContainerProvider.cs` uses `SemaphoreSlim(1,1)` with proper double-check locking and `finally` cleanup.
+- **S4 (Audit Trail Complete):** ✅ FIXED. `routingPolicyId` flows end-to-end: precheck → APIM → log → storage. All 6 steps verified.
+- **S5 (Type Consolidation):** ✅ FIXED. `ModelPricing` base type includes `multiplier: number` and `tierName: string`. No extended types needed.
+- **S6 (Type Safety):** ✅ FIXED. `PlanCreateRequest` and `PlanUpdateRequest` both include routing and billing fields.
+- **S7 (Cache Thread Safety):** ✅ FIXED. `ChargebackCalculator.cs` uses proper `lock()` with double-check pattern and no bare writes outside lock.
+- **S8 (Error Messages):** ✅ FIXED. `parseErrorMessage` helper applied consistently across all 27 API functions.
+**Why:** Production gate. Verify zero regressions and no new issues before deployment.
+**Result:** No regressions, no new issues found. Codebase is clean and ready for production.
+**Decision:** ✅ APPROVED FOR DEPLOYMENT. Merge and deploy backend + frontend together immediately.
+
 ## Governance
 
 - All meaningful changes require team consensus

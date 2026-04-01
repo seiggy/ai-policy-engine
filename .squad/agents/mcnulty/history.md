@@ -163,3 +163,24 @@ McNulty's comprehensive code review of Phases 0–4 delivered 11 findings:
 **Next Phase:** Deploy backend + frontend together. Schedule N1–N5 optimizations for future sprint.
 
 **Decision:** Merged review findings into `.squad/decisions.md`. Ready for production deployment.
+
+### 2026-03-31 — Re-Review Complete: All 11 Findings Verified ✅
+
+**Status:** APPROVED — independent verification of all 11 fixes.
+
+McNulty re-reviewed every file touched by Freamon (6 backend) and Kima (5 frontend). All fixes are correctly implemented, no regressions, no new issues introduced.
+
+**Key Verification Points:**
+- B1: Multiplier request quota enforcement is in the right place in PrecheckEndpoints.cs (after token check, before rate limits). Returns 429 with correct field names.
+- B2: `billingPeriod` is `string` in types.ts. RequestBilling.tsx renders it as-is — no `.year`/`.month` access.
+- B3: `RouteRule` has `priority: number` + `enabled: boolean`. RoutingPolicies.tsx form has both editable priority input and enabled toggle.
+- S1: `Repositories/` directory confirmed deleted. Zero namespace references remain.
+- S2: Both APIM policies use `JObject` construction — zero string interpolation in outbound log body.
+- S3: `SemaphoreSlim(1,1)` with proper double-check locking. No `volatile bool`.
+- S4: `routingPolicyId` flows end-to-end: precheck response → APIM capture → log payload → `LogIngestRequest` → `AuditLogItem` → `AuditLogDocument`.
+- S5: `ModelPricing` has `multiplier` + `tierName` on the base type. No `ModelPricingExtended` band-aid.
+- S6: `PlanCreateRequest` and `PlanUpdateRequest` both include all 4 multiplier billing fields.
+- S7: `lock(_cacheLock)` with double-check pattern. Timestamp set inside lock, Redis read outside. No bare access.
+- S8: `parseErrorMessage` helper applied consistently to all 27 API functions.
+
+**Verdict:** `.squad/decisions/inbox/mcnulty-rereview-verdict.md`
