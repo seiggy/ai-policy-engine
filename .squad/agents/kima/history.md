@@ -149,3 +149,21 @@ All work is done. Phase 0 (storage), Phase 1 (routing + pricing), Phase 2 (enfor
 
 **Build Results:** `tsc -b` clean, `vite build` succeeds (2556 modules, 11.5s).
 
+### 2026-04-01 — Fix #5: Frontend DTO Mismatch (CRITICAL)
+
+**Issue:** `RequestBilling.tsx` referenced fields that don't exist in the backend `RequestSummaryResponse.cs`. The frontend types (`RequestClientSummary`, `RequestSummaryTotals`) had invented fields (`planName`, `totalRequests`, `effectiveRequests`, `monthlyQuota`, `utilizationPercent`, `overbilledRequests`, `requestsByTier`, `requestsByModel`) that the backend never sends. At runtime this produced empty/NaN values.
+
+**Root Cause:** Frontend types were authored speculatively during Phase 4 without verifying the backend DTO field names. The C# model uses different naming: `rawRequestCount` not `totalRequests`, `totalEffectiveRequests` not `effectiveRequests`, `multiplierOverageCost` not `overbilledRequests`, `effectiveRequestsByTier` not `requestsByTier`.
+
+**What Changed:**
+1. **types.ts** — Renamed `RequestClientSummary` → `RequestSummaryClient` to match backend class name. Fixed all fields to match `RequestSummaryResponse.cs` exactly: `totalEffectiveRequests`, `effectiveRequestsByTier`, `multiplierOverageCost`, `rawRequestCount`. Removed phantom fields (`planName`, `totalRequests`, `effectiveRequests`, `monthlyQuota`, `utilizationPercent`, `overbilledRequests`, `requestsByModel`). Fixed `RequestSummaryTotals`: `totalRawRequests`, `totalMultiplierOverageCost`, `effectiveRequestsByTier`.
+2. **RequestBilling.tsx** — Updated all field accesses to match corrected types. Removed UI columns for non-existent fields (Plan, Quota, Utilization). Changed "Overbilled" KPI to "Overage Cost" (displays dollar amount). Changed overage alerts from utilization-percent-based to cost-based. Removed unused `Progress` import.
+3. **api.ts** — No changes needed; already returns correct type.
+
+**Learnings:**
+- Always verify frontend types against the actual backend C# model before building UI. The backend is the source of truth.
+- Field naming convention: C# PascalCase serializes to camelCase in JSON by default with System.Text.Json — match those exact camelCase names in TypeScript.
+- When backend doesn't provide a computed field (like `utilizationPercent`), don't invent it in the DTO — compute it in the UI from available data, or omit the feature.
+
+**Build Results:** `tsc -b` clean, `vite build` succeeds (2556 modules, 9.65s).
+

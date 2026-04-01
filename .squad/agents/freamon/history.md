@@ -175,3 +175,28 @@
 - `Services/ChargebackCalculator.cs` — Added `_cacheLock` object. Double-check locking pattern: outer check without lock, inner check-and-set of `_lastCacheRefresh` inside lock, actual Redis read outside lock (async-safe). Prevents stampede while keeping I/O non-blocking.
 
 **Test results:** 198/198 tests pass, 0 regressions (net -22 from deleted Repositories tests that tested dead code)
+
+### Codebase Review Fixes — 4 Validated Findings (2026-04-01)
+
+**What was done:** Implemented 4 fixes from codebase review (#1, #2, #11, #15).
+
+**#1 — Audit record duplication on retry (CRITICAL):**
+- `Services/AuditLogWriter.cs` — Replaced random `Guid.NewGuid()` IDs with deterministic SHA256-based IDs derived from `clientAppId|tenantId|deploymentId|timestamp|totalTokens|promptTokens`. Documents are built once before the retry loop with stable IDs, so retries are idempotent.
+- `Services/AuditStore.cs` — Changed `WriteBatchAsync` from `CreateItemAsync` to `UpsertItemAsync`, ensuring partial-success retries don't fail with 409 Conflict on already-written documents.
+
+**#2 — Billing summary race condition (CRITICAL):**
+- `Services/AuditStore.cs` — `UpsertBillingSummariesAsync` now uses Cosmos optimistic concurrency with ETags. Reads capture the ETag, writes pass `IfMatchEtag`. On 412 (Precondition Failed), re-reads and retries up to 5 times. Prevents concurrent batches from silently overwriting each other's usage accumulations.
+
+**#11 — AuditStore initialization race condition (IMPORTANT):**
+- `Services/AuditStore.cs` — Replaced `volatile bool _initialized` with `SemaphoreSlim(1,1)` double-check locking pattern, matching the fix already applied to `ConfigurationContainerProvider`. Prevents duplicate container creation calls under concurrent initialization.
+
+**#15 — LogIngest lock released before Cosmos write (IMPORTANT):**
+- `Endpoints/LogIngestEndpoints.cs` — Increased Redis lock TTL from 5s to 30s to prevent lock auto-expiry during the read-compute-write cycle. Added `LockExtendAsync` call immediately before `clientRepo.UpsertAsync` to refresh the TTL, ensuring the lock cannot expire during Cosmos I/O even if earlier operations were slow.
+
+**Patterns applied:**
+- Deterministic document IDs (SHA256 hash of identity fields) for natural idempotency
+- ETag-based optimistic concurrency with read-modify-write retry loop for Cosmos upserts
+- SemaphoreSlim double-check locking for async initialization (consistent with ConfigurationContainerProvider)
+- Redis lock TTL extension before slow I/O operations to prevent silent lock expiry
+
+**Test results:** 198/198 tests pass, 0 regressions

@@ -184,3 +184,118 @@ McNulty re-reviewed every file touched by Freamon (6 backend) and Kima (5 fronte
 - S8: `parseErrorMessage` helper applied consistently to all 27 API functions.
 
 **Verdict:** `.squad/decisions/inbox/mcnulty-rereview-verdict.md`
+
+### 2026-04-01 — Full Codebase Review: Pre-Ship Quality Audit
+
+**Status:** CONDITIONALLY APPROVED for preview. Fix CRITICALs before GA.
+
+**Scope:** Entire product — every file in every layer. Not a diff review; a full product audit requested by Zack Way before shipping.
+
+**Findings: 47 total (11 CRITICAL, 20 IMPORTANT, 16 IMPROVEMENT)**
+
+**Critical Issues Found:**
+1. **CORS allows any origin** (Program.cs:136) — exploitable with JWT auth
+2. **AuditStore initialization race** — volatile bool without semaphore, unlike ConfigurationContainerProvider which was correctly fixed
+3. **APIM Contributor on entire RG** (main.bicep:322) — can delete any resource
+4. **HTTP allowed on Chargeback API** (apimFuncApi.bicep:34) — cleartext JWT tokens
+5. **No subscription requirement** on Chargeback API in APIM (apimFuncApi.bicep:37)
+6. **Cosmos local auth enabled** (cosmosAccount.bicep:15) — keys bypass RBAC
+7. **ACR credentials in plain secret** (containerApp.bicep:85-97) — not Key Vault
+8. **APIM on-error leaks internals** — ErrorSource, ErrorPolicyId headers exposed
+9. **JWT validation accepts any tenant** — no issuer/scope restriction
+10. **Frontend type mismatches** — RequestSummaryResponse field names don't match backend
+11. **Health checks only in Development** — production Container App has no /health
+
+**Key Patterns Found Across Layers:**
+- Infrastructure Bicep modules have inconsistent security posture: Redis is excellent (TLS, Entra-only), but Key Vault uses legacy access policies, Storage allows public blobs, Cosmos has keys enabled
+- Thread safety was correctly fixed in ChargebackCalculator (lock + double-check) and ConfigurationContainerProvider (SemaphoreSlim), but AuditStore was missed
+- Frontend types drifted from backend after multiplier billing feature — several interfaces have wrong field names
+- Test coverage has gaps in newer endpoint groups (RoutingPolicy, Deployment, RequestBilling CRUD endpoints)
+- Documentation has wrong repo URLs in 3 files and contradictory TTL values
+
+**What's Solid:**
+- Repository pattern, write-through caching, routing evaluator, billing math, authorization model, Redis security, managed identity usage, Aspire orchestration, 198-test suite, backward compatibility
+
+**Review output:** `.squad/decisions/inbox/mcnulty-full-codebase-review.md`
+
+### 2026-04-01 — Product Rebrand: README & Documentation Rewrite
+
+**Status:** COMPLETE ✅
+
+McNulty rewrote README.md and updated all associated documentation to reflect the new product identity and all features built during Phases 0–4.
+
+**What Changed:**
+
+1. **Product Renaming**: "Azure API Management OpenAI Chargeback Environment" → **"Azure AI Gateway Policy Engine"**
+   - Emphasizes APIM-based AAA (Authentication, Authorization, Accounting) for AI workloads
+   - Telecom/RADIUS heritage positioning
+   - Reflects the policy engine architecture (not just chargeback)
+
+2. **README.md Completely Rewritten** (590 lines):
+   - TL;DR clarifies the three pillars: durability (CosmosDB source of truth), routing (auto-router), and billing (multiplier pricing)
+   - New "The Problem We Solve" table: 9 challenges with solutions addressing new features
+   - Expanded Architecture section with detailed decision flow (precheck → routing → rate limit → cost)
+   - **New Key Features Section** (subsections):
+     - 🔐 Authentication & Authorization at the Gate
+     - 🚀 Intelligent Model Routing (Auto-Router) with three modes
+     - 💰 Per-Request Multiplier Pricing (GHCP-style) with examples
+     - 🗄️ CosmosDB Source of Truth + Redis Cache (write-through pattern)
+     - 📊 Adaptive Billing Dashboard (token/multiplier/hybrid modes)
+     - 📋 Bill-Back Reporting (per-client, tier breakdown, CSV export)
+     - ⚡ APIM Policy Enforcement at the Gateway
+     - 🧪 Comprehensive Test Suite (198+ tests)
+     - 🏗️ Production-Ready Infrastructure
+   - Updated Dashboard section with routing policies page
+   - New API Endpoints table (18 endpoints including routing, billing, export)
+   - Added note about internal "Chargeback" naming and pending rename
+
+3. **Documentation Updates**:
+   - `docs/ARCHITECTURE.md`: Updated product name, added CosmosDB architecture, detailed request flow with routing & multiplier billing decisions
+   - `docs/DOTNET_DEPLOYMENT_GUIDE.md`: .NET 9 (was 10), product name updated
+   - `docs/FAQ.md`: Completely rewritten (7 sections, 30+ Q&A covering all new features):
+     - Multiplier pricing examples
+     - Auto-router behavior vs. enforced rewriting
+     - CosmosDB durability guarantees
+     - Multi-tenant scenarios
+     - Hybrid billing mode
+     - Deployment options (Bicep vs. Terraform)
+     - Troubleshooting common issues
+   - `docs/USAGE_EXAMPLES.md`: Updated product name, examples remain valid
+
+4. **TL;DR Messaging**:
+   - Before: "Usage tracking and chargeback through APIM"
+   - After: "APIM-based AAA for AI workloads" with focus on durability, routing, and adaptive billing
+
+**Files Modified**:
+- README.md (major rewrite, 590 lines)
+- docs/ARCHITECTURE.md (product name, CosmosDB architecture, detailed flow)
+- docs/DOTNET_DEPLOYMENT_GUIDE.md (.NET 9, product name)
+- docs/FAQ.md (comprehensive rewrite, 7 sections)
+- docs/USAGE_EXAMPLES.md (product name)
+
+**Key Messaging Retained**:
+- Multi-tenant customer model (clientAppId:tenantId)
+- WebSocket real-time dashboard
+- 198+ test suite
+- Bicep/Terraform dual IaC paths
+- Aspire orchestration
+- CosmosDB audit trail (36 months)
+- Purview integration (optional)
+
+**What's New in Documentation**:
+- Explicit CosmosDB source-of-truth architecture (vs. Redis-only perception in old docs)
+- Three routing modes explained (per-account, enforced, QoS-based)
+- Multiplier pricing with concrete examples (1.0x baseline, 0.33x tier)
+- Hybrid billing mode support (token + multiplier mixed plans)
+- Bill-back reporting details (per-client effective requests, tier breakdown)
+- Adaptive dashboard UI behavior
+- Auto-router decision flow (not enforced rewriting)
+- Deployment discovery integration (Foundry)
+- Comprehensive FAQ with troubleshooting
+
+**Why This Matters**:
+- Customers now understand the product's core value: durable policy engine for AI consumption (not just cost tracking)
+- Clear distinction between authentication (at gate), authorization (plan + deployment checks), and accounting (billing)
+- Documentation reflects actual architecture (CosmosDB + Redis) and not implied Redis-only storage
+- New features (multiplier billing, routing, adaptive UI) are front-and-center
+- Legacy "Chargeback" naming acknowledged with pending rename roadmap

@@ -113,4 +113,41 @@ All work is done. Phase 3 (APIM auto-router policies) is complete, Phase 4 (Fron
 - Health check integration for fallback routing
 - Load-based routing for PTU optimization
 
+### 2026-04-01 — Infrastructure Hardening: 5 Validated Findings Fixed
 
+**Findings Fixed:** #6, #8, #9, #10, #17
+
+**#6 — APIM Least-Privilege Roles (CRITICAL):**
+- **Removed** Contributor role assignment on entire RG for APIM — over-privileged and unnecessary.
+- **Fixed wrong GUID**: Key Vault Secrets User assignment was using `7f951dda` (AcrPull!) instead of `4633458b` (Key Vault Secrets User). Bug in original Bicep.
+- **Upgraded** OpenAI role from `Cognitive Services User` to `Cognitive Services OpenAI User` — narrower scope, least-privilege.
+- APIM now has exactly 2 roles: Key Vault Secrets User + Cognitive Services OpenAI User.
+- APIM→Container App calls use Entra ID token acquisition, not Azure RBAC — no role needed.
+
+**#8 — Cosmos Keys Disabled (CRITICAL):**
+- Set `disableLocalAuth: true` on Cosmos account. Managed identity only (DefaultAzureCredential already in use).
+- Connection strings with keys can no longer authenticate. All access via Entra ID.
+
+**#9 — ACR Managed Identity Pull (CRITICAL):**
+- Replaced admin username/password ACR pull with `identity: 'system'` on Container App registry config.
+- Removed `acrUsername` and `acrPassword` params from Bicep + deployment scripts.
+- Added `acrName` param + conditional AcrPull role assignment for Container App managed identity.
+- Updated `parameter.json`, `parameter.sample.json`, `setup-azure.ps1`, `setup-azure.sh`.
+
+**#10 — Health Checks Unconditional (IMPORTANT):**
+- Removed `if (app.Environment.IsDevelopment())` gate from `MapDefaultEndpoints()` in ServiceDefaults.
+- Health endpoints `/health` and `/alive` now always registered with `.AllowAnonymous()`.
+- Required for container orchestration liveness/readiness probes in production.
+
+**#17 — Streaming Parser Hardened (IMPORTANT):**
+- Changed chunk filter from `l.Contains("{")` to `l.Contains("\"usage\"")` in both APIM policies.
+- Now only parses SSE chunks that contain the `"usage"` field, not arbitrary JSON (error responses, etc.).
+- Applied identically to `subscription-key-policy.xml` and `entra-jwt-policy.xml`.
+
+**Verification:** 198/198 tests pass. Build clean. Zero regressions.
+
+**Key Learnings:**
+- The original Key Vault role assignment for APIM was silently using the AcrPull GUID (`7f951dda`). Always cross-check role GUIDs against `roles.json` — don't trust inline comments.
+- `Cognitive Services User` is broader than `Cognitive Services OpenAI User` — for APIM calling only OpenAI, the narrower role suffices.
+- Container Apps support `identity: 'system'` in registry config — no need for admin creds or secretRef.
+- Aspire ServiceDefaults template gates health checks behind `IsDevelopment()` by default — must override for production container deployments.

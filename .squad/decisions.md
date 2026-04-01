@@ -113,6 +113,18 @@ This applies to dashboards, usage views, client detail pages, and export options
 **Result:** No regressions, no new issues found. Codebase is clean and ready for production.
 **Decision:** ✅ APPROVED FOR DEPLOYMENT. Merge and deploy backend + frontend together immediately.
 
+### 2026-04-01T18:00:00Z: API is single-tenant — IDOR finding dismissed
+**By:** Zack Way (via Copilot)  
+**Status:** Accepted  
+**What:** The management API is single-tenant only (single-tenant app registration). Secondary tenants cannot authenticate to the API — they only communicate with the APIM gateway. APIM calls the API using its own Managed Identity credentials, unwrapping client auth data. This means IDOR vulnerabilities around tenant scoping are not applicable — there is no multi-tenant auth surface on the API itself.  
+**Why:** Code review finding dismissal — reviewers incorrectly assumed multi-tenant API access model.
+
+### 2026-04-01T18:49:00Z: Product rename to Azure AI Gateway Policy Engine
+**By:** Zack Way (via Copilot)  
+**Status:** Accepted  
+**What:** The product is being renamed from "AI Policy Engine" to "Azure AI Gateway Policy Engine". All references in README, docs, and descriptions should use the new name. A full rename of projects, namespaces, containers, etc. will follow as a separate task after current bug fixes complete.  
+**Why:** User directive — product branding update.
+
 ## Governance
 
 - All meaningful changes require team consensus

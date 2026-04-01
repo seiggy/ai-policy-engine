@@ -1,0 +1,32 @@
+squad: 10 codebase findings fixed + README rewrite for Azure AI Gateway Policy Engine
+
+Orchestration log entries written for all 4 agents (Freamon, Kima, Sydnor, McNulty).
+Session log recorded: 2026-04-01T18-50-codebase-fixes-readme.md
+
+Code review findings fixed:
+- B1: Precheck quota enforcement for multiplier billing
+- B2: BillingPeriod type correction (types.ts)
+- B3: RouteRule fields (priority, enabled)
+- S1: Dead Repositories/ directory removed
+- S3: AuditStore thread safety (SemaphoreSlim)
+- S4: Audit trail flow (routingPolicyId end-to-end)
+- S5: Type consolidation (ModelPricing)
+- S6: Type safety (PlanCreateRequest/UpdateRequest)
+- S7: Cache thread safety (ChargebackCalculator)
+- S8: Error message parsing consistency
+
+Documentation rebrand:
+- README.md rewritten for "Azure AI Gateway Policy Engine"
+- ARCHITECTURE.md, FAQ.md, DOTNET_DEPLOYMENT_GUIDE.md, USAGE_EXAMPLES.md updated
+- All product references consistent
+
+Decision inbox merged into decisions.md:
+- API single-tenant architecture clarification
+- Product rebrand directive
+- Re-review verdict (APPROVED FOR DEPLOYMENT)
+
+Backend: 198/198 tests passing, zero regressions
+Frontend: tsc clean, vite clean, zero regressions
+Ready for preview deployment.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
