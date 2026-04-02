@@ -151,3 +151,23 @@ All work is done. Phase 3 (APIM auto-router policies) is complete, Phase 4 (Fron
 - `Cognitive Services User` is broader than `Cognitive Services OpenAI User` — for APIM calling only OpenAI, the narrower role suffices.
 - Container Apps support `identity: 'system'` in registry config — no need for admin creds or secretRef.
 - Aspire ServiceDefaults template gates health checks behind `IsDevelopment()` by default — must override for production container deployments.
+
+### 2026-04-01 — AADSTS50011 Redirect URI Mismatch Fixed
+
+**Bug:** After Bicep deployment, the React SPA failed to authenticate — Entra ID returned `AADSTS50011` because the redirect URI didn't match any configured URIs on the app registration.
+
+**Root Cause (two issues):**
+
+1. **Wrong app registration (PowerShell only):** `setup-azure.ps1` Phase 8 set SPA redirect URIs on `$client1ObjId` (Chargeback Sample Client) but NOT on `$apiObjId` (Chargeback API). The frontend's MSAL config uses the API app's client ID (`VITE_AZURE_CLIENT_ID=$apiAppId`), so the redirect must be on the API app. The bash version (`setup-azure.sh`) already correctly targeted both apps — the PowerShell script was missing the API app.
+
+2. **Trailing slash mismatch (both scripts):** Both `setup-azure.ps1` and `setup-azure.sh` registered URIs with trailing slashes (`https://host/`) but the MSAL SPA sends `window.location.origin` which returns `https://host` without a trailing slash. Entra ID performs exact matching on SPA redirect URIs.
+
+**Fix:**
+- `setup-azure.ps1` Phase 8: Added API app redirect URI configuration (Graph PATCH on `$apiObjId`) before the client app 1 configuration. Removed trailing slashes.
+- `setup-azure.sh` Phase 8: Removed trailing slashes from redirect URIs.
+- `deploy-container.ps1`: Already correct — no changes needed (targets API app, no trailing slashes).
+
+**Key Learnings:**
+- MSAL SPA `redirectUri: window.location.origin` always returns URLs without trailing slashes. Entra ID SPA redirect URI matching is exact — `https://host/` ≠ `https://host`.
+- When the frontend uses `VITE_AZURE_CLIENT_ID` = API app ID, the SPA redirect URI must be registered on that API app registration, not just on client apps.
+- Always cross-check PowerShell and bash versions of deployment scripts — they can drift independently.

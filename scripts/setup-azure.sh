@@ -997,8 +997,8 @@ phase_header "Phase 8: Entra Redirect URIs"
 
 info "Setting SPA redirect URIs on API app (used by dashboard UI)..."
 redirect_body=$(jq -n \
-    --arg u1 "https://$container_app_url/" \
-    --arg u2 "http://localhost:5173/" \
+    --arg u1 "https://$container_app_url" \
+    --arg u2 "http://localhost:5173" \
     '{"spa":{"redirectUris":[$u1,$u2]}}')
 tmp_redirect=$(mktemp)
 echo "$redirect_body" > "$tmp_redirect"
@@ -1007,7 +1007,7 @@ az rest --method PATCH \
     --headers "Content-Type=application/json" --body "@$tmp_redirect" -o none \
     || { rm -f "$tmp_redirect"; die "Failed to set redirect URIs on API app."; }
 rm -f "$tmp_redirect"
-success "API app redirect URIs: https://$container_app_url/, http://localhost:5173/"
+success "API app redirect URIs: https://$container_app_url, http://localhost:5173"
 
 info "Setting SPA redirect URIs on client app 1..."
 tmp_redirect=$(mktemp)
@@ -1017,7 +1017,7 @@ az rest --method PATCH \
     --headers "Content-Type=application/json" --body "@$tmp_redirect" -o none \
     || { rm -f "$tmp_redirect"; die "Failed to set redirect URIs on client app 1."; }
 rm -f "$tmp_redirect"
-success "Client app 1 redirect URIs: https://$container_app_url/, http://localhost:5173/"
+success "Client app 1 redirect URIs: https://$container_app_url, http://localhost:5173"
 
 echo -e "  ${GREEN}Phase 8 complete ✓${NC}"
 echo ""
