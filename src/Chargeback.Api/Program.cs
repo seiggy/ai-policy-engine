@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using System.Threading.Channels;
 using Azure.Identity;
 using Chargeback.Api.Endpoints;
@@ -10,6 +11,14 @@ var builder = WebApplication.CreateBuilder(args);
 
 // Aspire service defaults: OpenTelemetry, health checks, service discovery, resilience
 builder.AddServiceDefaults();
+
+// Configure HTTP JSON options for minimal API model binding (enum as string, camelCase)
+builder.Services.ConfigureHttpJsonOptions(options =>
+{
+    options.SerializerOptions.PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase;
+    options.SerializerOptions.PropertyNameCaseInsensitive = true;
+    options.SerializerOptions.Converters.Add(new JsonStringEnumConverter());
+});
 
 // Redis via Aspire integration — uses Entra ID managed identity in Azure,
 // falls back to password auth for local Aspire dev containers.

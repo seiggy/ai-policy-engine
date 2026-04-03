@@ -200,3 +200,22 @@
 - Redis lock TTL extension before slow I/O operations to prevent silent lock expiry
 
 **Test results:** 198/198 tests pass, 0 regressions
+
+### Routing Policy 400 Bug Fix — Enum Deserialization (2026-04-01)
+
+**What was done:** Fixed silent 400 on routing policy creation. The payload `{"defaultBehavior":"Passthrough"}` was rejected by ASP.NET Core model binding before the endpoint handler ran — no logging, no error detail.
+
+**Root cause:** `RoutingBehavior` enum had no `JsonStringEnumConverter`. System.Text.Json defaults to integer-based enum deserialization. String value `"Passthrough"` failed model binding → framework returned 400 silently. The endpoint handler never executed, so none of our validation logging fired.
+
+**Key files modified:**
+- `Models/RoutingBehavior.cs` — Added `[JsonConverter(typeof(JsonStringEnumConverter))]` attribute so the enum serializes/deserializes as strings in any context
+- `Services/JsonConfig.cs` — Added `JsonStringEnumConverter` to shared serializer options for explicit serialize/deserialize calls
+- `Program.cs` — Added `ConfigureHttpJsonOptions` with `JsonStringEnumConverter` as defense-in-depth for all future enums used in minimal API model binding
+- `Endpoints/RoutingPolicyEndpoints.cs` — Added `ILogger` param to `ValidateDeployments` and logging on all rejection paths (empty Foundry, invalid deployment names, missing name). Future 400s will never be silent.
+
+**Patterns established:**
+- All enums used in API DTOs must have `[JsonConverter(typeof(JsonStringEnumConverter))]`
+- Global `ConfigureHttpJsonOptions` ensures minimal API model binding handles string enums
+- Validation methods should accept `ILogger` and log rejection reasons before returning error objects
+
+**Test results:** 198/198 tests pass, 0 regressions

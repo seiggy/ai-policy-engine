@@ -80,9 +80,12 @@ public static class RoutingPolicyEndpoints
         try
         {
             if (string.IsNullOrWhiteSpace(body.Name))
+            {
+                logger.LogWarning("Create routing policy rejected: name is required");
                 return Results.BadRequest("Routing policy name is required");
+            }
 
-            var validationError = await ValidateDeployments(body.Rules, body.FallbackDeployment, deploymentService);
+            var validationError = await ValidateDeployments(body.Rules, body.FallbackDeployment, deploymentService, logger);
             if (validationError is not null)
                 return Results.BadRequest(validationError);
 
@@ -149,7 +152,7 @@ public static class RoutingPolicyEndpoints
             // Validate deployments in the rules being updated
             var rulesToValidate = body.Rules ?? policy.Rules;
             var fallbackToValidate = body.FallbackDeployment ?? policy.FallbackDeployment;
-            var validationError = await ValidateDeployments(rulesToValidate, fallbackToValidate, deploymentService);
+            var validationError = await ValidateDeployments(rulesToValidate, fallbackToValidate, deploymentService, logger);
             if (validationError is not null)
                 return Results.BadRequest(validationError);
 
@@ -231,7 +234,8 @@ public static class RoutingPolicyEndpoints
     private static async Task<object?> ValidateDeployments(
         List<RouteRule>? rules,
         string? fallbackDeployment,
-        IDeploymentDiscoveryService deploymentService)
+        IDeploymentDiscoveryService deploymentService,
+        ILogger logger)
     {
         if ((rules is null || rules.Count == 0) && string.IsNullOrWhiteSpace(fallbackDeployment))
             return null;
@@ -242,6 +246,7 @@ public static class RoutingPolicyEndpoints
         // If discovery returned no deployments, reject the request (cannot validate routing rules)
         if (knownIds.Count == 0)
         {
+            logger.LogWarning("Routing policy rejected: Foundry returned 0 deployments — cannot validate");
             return new
             {
                 error = "No deployments available from Foundry. Cannot validate routing rules."
@@ -264,6 +269,9 @@ public static class RoutingPolicyEndpoints
 
         if (invalidDeployments.Count > 0)
         {
+            logger.LogWarning(
+                "Routing policy rejected: invalid deployments {Invalid}. Available: {Available}",
+                invalidDeployments, knownIds.ToList());
             return new
             {
                 error = "One or more deployments are not known Foundry deployments",
