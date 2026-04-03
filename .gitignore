@@ -92,11 +92,14 @@ src/Chargeback.LoadTest/reports/
 
 .agentic/
 .agentic-dev.json
-.copilot/skills/
-# Squad: ignore runtime state (logs, inbox, sessions)
-.squad/orchestration-log/
-.squad/log/
-.squad/decisions/inbox/
-.squad/sessions/
-# Squad: SubSquad activation file (local to this machine)
-.squad-workstream
+
+# Copilot agent configuration (local tooling, not part of the product)
+.copilot/
+.github/agents/
+.github/skills/
+.github/workflows/squad-*.yml
+.github/workflows/sync-squad-labels.yml
+.gitattributes
+
+# Squad AI team state (local tooling, not part of the product)
+.squad/
