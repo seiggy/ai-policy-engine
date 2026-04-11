@@ -5,12 +5,15 @@ using Microsoft.Agents.AI.Purview;
 namespace Chargeback.Api.Services;
 
 /// <summary>
-/// Configures the Microsoft Agent Framework (MAF) Purview integration
-/// for DLP policy validation and audit emission on AI interactions.
+/// Configures the Microsoft Purview integration for DLP policy validation and audit emission.
 ///
-/// This service is a log receiver, not an AI agent — so we use Purview's
-/// Content Activities API for audit emission rather than the chat middleware pattern.
-/// The PurviewClient is registered for direct use by the <see cref="PurviewAuditService"/>.
+/// This service is a log receiver, not an AI agent — so we use Purview's Content Activities
+/// API for audit emission rather than the chat middleware pattern.
+///
+/// DI strategy: a single <em>base</em> <see cref="PurviewSettings"/> instance is registered
+/// (without an <c>AppName</c> lock-in). <see cref="PurviewAuditService"/> creates a per-event
+/// copy, overriding <c>AppName</c> with the emitting client's display name so that Purview
+/// groups activity under the correct application identity.
 ///
 /// Reference: https://github.com/microsoft/agent-framework/tree/main/dotnet/src/Microsoft.Agents.AI.Purview
 /// </summary>
@@ -30,7 +33,9 @@ public static class PurviewServiceExtensions
             return services;
         }
 
-        var settings = new PurviewSettings(configuration["PURVIEW_APP_NAME"] ?? "Chargeback API")
+        // "Base" settings — AppName intentionally left as the service-level fallback.
+        // PurviewAuditService overrides AppName per-event with the client's display name.
+        var baseSettings = new PurviewSettings(configuration["PURVIEW_APP_NAME"] ?? "Chargeback API")
         {
             AppVersion = "1.0.0",
             TenantId = configuration["PURVIEW_TENANT_ID"],
@@ -42,11 +47,23 @@ public static class PurviewServiceExtensions
             MaxConcurrentJobConsumers = int.TryParse(configuration["PURVIEW_MAX_CONCURRENT_CONSUMERS"], out var consumers) ? consumers : 10,
         };
 
+        var blockEnabled = bool.TryParse(configuration["PURVIEW_BLOCK_ENABLED"], out var block) && block;
+
         TokenCredential credential = new DefaultAzureCredential();
 
-        services.AddSingleton(settings);
+        // Register a named HttpClient for PurviewGraphClient. The factory manages connection
+        // pooling and lifetime; PurviewGraphClient does not dispose the instance it receives.
+        services.AddHttpClient("PurviewGraphClient");
+
+        services.AddSingleton(baseSettings);
         services.AddSingleton(credential);
-        services.AddSingleton<IPurviewAuditService, PurviewAuditService>();
+        services.AddSingleton<IPurviewAuditService>(sp =>
+            new PurviewAuditService(
+                sp.GetRequiredService<PurviewSettings>(),
+                sp.GetRequiredService<TokenCredential>(),
+                sp.GetRequiredService<ILogger<PurviewAuditService>>(),
+                blockEnabled,
+                sp.GetRequiredService<IHttpClientFactory>()));
 
         return services;
     }

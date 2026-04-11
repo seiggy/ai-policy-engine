@@ -281,7 +281,7 @@ public static class LogIngestEndpoints
             metrics.RecordRequest(ingestRequest.TenantId, ingestRequest.ClientAppId, model);
 
             // Emit Purview audit event (fire-and-forget via background channel)
-            await purviewAudit.EmitAuditEventAsync(ingestRequest);
+            await purviewAudit.EmitAuditEventAsync(ingestRequest, clientAssignment?.DisplayName ?? ingestRequest.ClientAppId);
 
             // Enqueue audit item for durable Cosmos DB persistence (non-blocking)
             auditChannel.Writer.TryWrite(new AuditLogItem

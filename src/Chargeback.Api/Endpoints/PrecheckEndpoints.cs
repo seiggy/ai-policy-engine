@@ -19,6 +19,12 @@ public static class PrecheckEndpoints
             .WithName("Precheck")
             .WithDescription("Pre-authorize a client+tenant request — checks plan, quota, rate limits, and model routing")
             .RequireAuthorization("ApimPolicy");
+
+        routes.MapPost("/api/content-check/{clientAppId}/{tenantId}", ContentCheck)
+            .WithName("ContentCheck")
+            .WithDescription("DLP content check — evaluates prompt against Purview policy before forwarding to LLM")
+            .RequireAuthorization("ApimPolicy");
+
         return routes;
     }
 
@@ -223,6 +229,45 @@ public static class PrecheckEndpoints
         }
 
         return policy;
+    }
+
+    private static async Task<IResult> ContentCheck(
+        string clientAppId,
+        string tenantId,
+        HttpContext context,
+        IRepository<ClientPlanAssignment> clientRepo,
+        IPurviewAuditService purviewAuditService,
+        ILogger<PlanData> logger,
+        CancellationToken cancellationToken)
+    {
+        using var reader = new StreamReader(context.Request.Body);
+        var content = await reader.ReadToEndAsync(cancellationToken);
+
+        var clientId = $"{clientAppId}:{tenantId}";
+        var assignment = await clientRepo.GetAsync(clientId);
+
+        string clientDisplayName = clientAppId;
+        if (assignment is null)
+        {
+            logger.LogWarning(
+                "Content check — client not found (using fallback): ClientAppId={ClientAppId} TenantId={TenantId}",
+                clientAppId, tenantId);
+        }
+        else
+        {
+            clientDisplayName = assignment.DisplayName ?? clientAppId;
+        }
+
+        var result = await purviewAuditService.CheckContentAsync(content, tenantId, clientDisplayName, cancellationToken);
+
+        if (result.IsBlocked)
+        {
+            return Results.Json(
+                new { blocked = true, message = result.BlockMessage },
+                statusCode: 451);
+        }
+
+        return Results.Ok(new { blocked = false });
     }
 
     /// <summary>Invalidates the in-memory routing policy cache (for testing).</summary>
