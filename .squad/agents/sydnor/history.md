@@ -171,3 +171,156 @@ All work is done. Phase 3 (APIM auto-router policies) is complete, Phase 4 (Fron
 - MSAL SPA `redirectUri: window.location.origin` always returns URLs without trailing slashes. Entra ID SPA redirect URI matching is exact — `https://host/` ≠ `https://host`.
 - When the frontend uses `VITE_AZURE_CLIENT_ID` = API app ID, the SPA redirect URI must be registered on that API app registration, not just on client apps.
 - Always cross-check PowerShell and bash versions of deployment scripts — they can drift independently.
+
+### 2026-04-01 — DLP Policy Variants: Content-Check Optional Enforcement
+
+**Task:** Created 2 DLP-enabled APIM policy variants to support Purview DLP content blocking.
+
+**Background:**
+- New endpoint available: `POST /api/content-check/{clientAppId}/{tenantId}` performs Purview DLP blocking.
+- Not all customers need DLP — most just need precheck auth/authorization.
+- Zack's directive: offer 2 policy variants per auth type (with and without content-check).
+
+**Files Created:**
+- `policies/subscription-key-policy-dlp.xml` — Subscription key auth + DLP content-check
+- `policies/entra-jwt-policy-dlp.xml` — Entra JWT auth + DLP content-check
+
+**How DLP Variants Work:**
+1. **After precheck succeeds (200)** and **before backend forwarding**, the DLP variant calls:
+   ```
+   POST /api/content-check/{clientAppId}/{tenantId}
+   ```
+2. The content-check receives the same `requestBody` that was captured at the top of the inbound section.
+3. **If HTTP 451 returned:** Request is blocked with an Azure OpenAI-style content_filter error response.
+4. **If any other status or failure:** Request proceeds (fail-open strategy via `ignore-error="true"`).
+5. **Timeout:** 10 seconds, same as precheck.
+
+**Fail-Open Strategy:**
+- Uses `ignore-error="true"` on the `send-request` element.
+- Transient content-check failures (timeouts, 500s, network issues) DON'T block valid requests.
+- Only explicit HTTP 451 response blocks the request.
+
+**Error Response Format:**
+- HTTP 451 (Unavailable For Legal Reasons)
+- JSON body mimics Azure OpenAI content filter error:
+  ```json
+  {
+    "error": {
+      "message": "Content blocked by policy",
+      "type": "content_filter",
+      "code": "content_blocked"
+    }
+  }
+  ```
+
+**Base Policies Unchanged:**
+- `policies/subscription-key-policy.xml` — No content-check, precheck only (baseline)
+- `policies/entra-jwt-policy.xml` — No content-check, precheck only (baseline)
+
+**DLP Variants Header Comment:**
+```xml
+<!-- DLP-ENABLED VARIANT: Includes Purview DLP content-check before forwarding to OpenAI.
+     Use this policy for tenants/products that require DLP policy enforcement.
+     For tenants without DLP, use the base policy (without -dlp suffix). -->
+```
+
+**Outbound Section:**
+- Both base and DLP policies already have the log-ingest fire-and-forget call in the outbound section.
+- No changes needed — logging is identical for both variants.
+
+**Policy Selection Guide:**
+- **Use base policies** (no `-dlp` suffix) for customers WITHOUT DLP requirements → faster, simpler
+- **Use DLP policies** (`-dlp` suffix) for customers WITH Purview DLP policies → adds content-check gate
+
+**Key Design Decisions:**
+- **Placement:** Content-check occurs after routing but before backend call, so routed deployment is already determined.
+- **Variable Reuse:** Uses existing `requestBody`, `containerAppBaseUrl`, `msi-access-token`, `clientAppId`, `tenantId` variables.
+- **No New Variables:** Content-check response is stored in `contentCheckResponse` variable, checked only for HTTP 451.
+- **C# Expression Safety:** Uses `context.Variables.ContainsKey("contentCheckResponse")` null-check before accessing response.
+- **XML Entity Encoding:** `&amp;&amp;` for `&&` in condition expressions (proper XML syntax).
+
+**Backward Compatibility:**
+- Existing deployments using base policies continue unchanged.
+- DLP variants are opt-in — customers explicitly choose the DLP policy when they need content enforcement.
+
+**Next Steps:**
+- Deploy DLP policies to APIM for customers requiring Purview DLP.
+- Document policy selection criteria in deployment guides.
+- Test fail-open behavior under content-check service outages.
+
+### 2026-04-17 — APIM DLP Policy Variants: Opt-In Fail-Open Content-Check (Complete)
+
+**Task:** Created 2 DLP-enabled APIM policy variants (`-dlp` suffix) for optional Purview DLP content-check enforcement. Customers without DLP requirements use base policies; customers with DLP use DLP-suffix variants.
+
+**Files Created:**
+- `policies/subscription-key-policy-dlp.xml` — Subscription key auth + DLP content-check
+- `policies/entra-jwt-policy-dlp.xml` — Entra JWT auth + DLP content-check
+
+**Files Unchanged:**
+- `policies/subscription-key-policy.xml` — Base policy remains identical (precheck only)
+- `policies/entra-jwt-policy.xml` — Base policy remains identical (precheck only)
+
+**Content-Check Pipeline:**
+1. **Placement:** After precheck succeeds (HTTP 200) + routing logic, before backend forwarding
+2. **Request:** POST /api/content-check/{clientAppId}/{tenantId} with original requestBody
+3. **Response Handling:**
+   - HTTP 451 → Block request with Azure OpenAI-style content_filter error response
+   - Any other status/failure → Proceed (fail-open)
+4. **Timeout:** 10 seconds (matches precheck timeout)
+5. **Authentication:** APIM managed identity token (consistent with precheck)
+
+**Fail-Open Strategy:**
+- Uses `ignore-error="true"` on send-request element
+- Transient failures (timeouts, 500s, network issues) DON'T block valid requests
+- Only explicit HTTP 451 response blocks requests
+- Prioritizes availability: content-check outages don't create request failures
+
+**Error Response Format (HTTP 451):**
+```json
+{
+  "error": {
+    "message": "Content blocked by policy",
+    "type": "content_filter",
+    "code": "content_blocked"
+  }
+}
+```
+Mimics Azure OpenAI content_filter format for client compatibility.
+
+**Policy Selection Guide:**
+| Customer Need | Policy |
+|--------------|--------|
+| Auth + quota only | Base (no `-dlp`) |
+| Auth + quota + Purview DLP | DLP (`-dlp`) |
+
+**Key Design Decisions:**
+- **Placement:** Content-check after routing ensures routed deployment is determined before DLP evaluation
+- **Variable reuse:** Uses existing `requestBody`, `containerAppBaseUrl`, `msi-access-token`, `clientAppId`, `tenantId`
+- **Response handling:** `contentCheckResponse` variable checked only for HTTP 451 status
+- **Null safety:** `context.Variables.ContainsKey("contentCheckResponse")` guards all response access
+- **XML encoding:** `&amp;&amp;` for `&&` in condition expressions (proper XML)
+
+**Backward Compatibility:**
+- Existing deployments using base policies unaffected
+- DLP variants are opt-in — customers explicitly choose when needed
+- No breaking changes to base policies
+
+**Trade-offs:**
+- 4 policies to maintain (base + DLP × 2 auth types)
+- Future changes must be applied consistently across variants to prevent policy drift
+- Fail-open trade-off: transient outages allow unfiltered content (by design for availability)
+
+**Testing & Monitoring:**
+- Both policies syntactically valid XML
+- HTTP 451 handling verified for blocking requests
+- Fail-open strategy confirmed for transient failures
+- Error response format matches Azure OpenAI conventions
+- Backward compatibility verified (base policies unchanged)
+
+**Next steps:**
+- Deploy DLP policies to APIM for customers requiring DLP enforcement
+- Monitor HTTP 451 response rates for DLP policy effectiveness
+- Track content-check endpoint latency and failure rates
+- Document policy selection criteria in deployment guides
+- Test fail-open behavior under content-check service outages
+

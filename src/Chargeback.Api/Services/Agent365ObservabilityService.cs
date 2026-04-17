@@ -1,18 +1,16 @@
 using Azure.Core;
 using Chargeback.Api.Models;
+using Microsoft.Agents.A365.Observability.Runtime.Tracing.Contracts;
+using Microsoft.Agents.A365.Observability.Runtime.Tracing.Scopes;
+using A365Request = Microsoft.Agents.A365.Observability.Runtime.Tracing.Contracts.Request;
 
 namespace Chargeback.Api.Services;
 
 /// <summary>
 /// Agent365 Observability service wrapper — creates InvokeAgent and Inference scopes.
 /// Uses lightweight identity (ClientAppId as agent ID) without provisioned Agentic Users.
+/// Wraps all scope creation in try/catch to ensure observability failures never break request flow.
 /// </summary>
-/// <remarks>
-/// NOTE: This is a minimal stub implementation for version 0.1.75-beta.
-/// The SDK API surface is still evolving. Once the SDK stabilizes with documented
-/// scope creation APIs (InvokeAgentScope.Start, InferenceScope.Start, etc.),
-/// this service should be updated to use those patterns.
-/// </remarks>
 public interface IAgent365ObservabilityService
 {
     IDisposable? StartInvokeAgentScope(string clientAppId, string tenantId, string? clientDisplayName, string? correlationId, string? promptContent = null);
@@ -20,8 +18,9 @@ public interface IAgent365ObservabilityService
 }
 
 /// <summary>
-/// Concrete implementation of A365 observability service.
-/// Currently a no-op stub pending SDK API stabilization.
+/// Concrete implementation of A365 observability service using SDK scope APIs.
+/// Creates InvokeAgentScope for request entry points and InferenceScope for LLM calls.
+/// Returns null on any failure to ensure resilience.
 /// </summary>
 public sealed class Agent365ObservabilityService : IAgent365ObservabilityService
 {
@@ -43,16 +42,64 @@ public sealed class Agent365ObservabilityService : IAgent365ObservabilityService
         string? correlationId,
         string? promptContent = null)
     {
-        // TODO: Once SDK exposes InvokeAgentScope.Start, implement here
-        _logger.LogTrace("A365 InvokeAgentScope stub: {ClientAppId}/{TenantId}", clientAppId, tenantId);
-        return null;
+        try
+        {
+            var agentDetails = new AgentDetails(
+                agentId: clientAppId,
+                agentName: clientDisplayName ?? clientAppId);
+
+            var endpoint = new Uri("https://apim.example.com"); // Placeholder endpoint
+            var invokeAgentDetails = new InvokeAgentDetails(
+                details: agentDetails,
+                endpoint: endpoint,
+                sessionId: correlationId ?? Guid.NewGuid().ToString());
+
+            var tenantDetails = new TenantDetails(Guid.Parse(tenantId));
+
+            var request = promptContent != null 
+                ? new A365Request(content: promptContent) 
+                : null;
+
+            return InvokeAgentScope.Start(
+                invokeAgentDetails: invokeAgentDetails,
+                tenantDetails: tenantDetails,
+                request: request,
+                conversationId: correlationId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to start A365 InvokeAgentScope — continuing without observability");
+            return null;
+        }
     }
 
     public IDisposable? StartInferenceScope(LogIngestRequest request, string? clientDisplayName)
     {
-        // TODO: Once SDK exposes InferenceScope.Start, implement here
-        _logger.LogTrace("A365 InferenceScope stub: {ClientAppId}/{TenantId}", request.ClientAppId, request.TenantId);
-        return null;
+        try
+        {
+            var agentDetails = new AgentDetails(
+                agentId: request.ClientAppId,
+                agentName: clientDisplayName ?? request.ClientAppId);
+
+            var inferenceDetails = new InferenceCallDetails(
+                operationName: InferenceOperationType.Chat,
+                model: request.ResponseBody?.Model ?? "unknown",
+                providerName: "AzureOpenAI",
+                inputTokens: (int?)(request.ResponseBody?.Usage?.PromptTokens),
+                outputTokens: (int?)(request.ResponseBody?.Usage?.CompletionTokens));
+
+            var tenantDetails = new TenantDetails(Guid.Parse(request.TenantId));
+
+            return InferenceScope.Start(
+                inferenceDetails,
+                agentDetails,
+                tenantDetails);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to start A365 InferenceScope — continuing without observability");
+            return null;
+        }
     }
 }
 

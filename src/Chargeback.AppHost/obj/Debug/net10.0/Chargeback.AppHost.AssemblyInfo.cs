@@ -23,7 +23,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("Chargeback.AppHost")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+d6a4106affe24bda0bae994f163b18e584223371")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+056263730e3248c20119030acce6e5112e074f98")]
 [assembly: System.Reflection.AssemblyProductAttribute("Chargeback.AppHost")]
 [assembly: System.Reflection.AssemblyTitleAttribute("Chargeback.AppHost")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
