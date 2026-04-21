@@ -180,6 +180,11 @@ if [[ -f "$tf_dir/terraform.tfstate" ]]; then
     popd > /dev/null
 fi
 
+if [[ -z "$gateway_app_id" ]]; then
+    # Fallback: look up by display name (Bicep-path deployments)
+    gateway_app_id=$(az ad app list --display-name "Chargeback APIM Gateway" --query "[0].appId" -o tsv 2>/dev/null || true)
+fi
+
 if [[ -n "$gateway_app_id" ]]; then
     gw_uris=$(az ad app show --id "$gateway_app_id" --query "identifierUris[]" -o tsv)
     if ! echo "$gw_uris" | grep -qF "api://$gateway_app_id"; then
@@ -268,7 +273,7 @@ assign_role "$export_role_id" "Chargeback.Export"
 echo ""
 yellow "  Step 2: Writing dashboard auth config..."
 
-ui_env_file="$REPO_ROOT/src/chargeback-ui/.env.production.local"
+ui_env_file="$REPO_ROOT/src/aipolicyengine-ui/.env.production.local"
 cat > "$ui_env_file" <<EOF
 VITE_AZURE_TENANT_ID=$tenant_id
 VITE_AZURE_CLIENT_ID=$api_app_id

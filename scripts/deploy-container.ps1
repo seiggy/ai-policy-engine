@@ -124,6 +124,11 @@ if (Test-Path (Join-Path $tfDir "terraform.tfstate")) {
     try { $gatewayAppId = (terraform output -raw gateway_app_id 2>$null) } catch {}
     Pop-Location
 }
+if ([string]::IsNullOrWhiteSpace($gatewayAppId)) {
+    # Fallback: look up by display name (Bicep-path deployments)
+    $gwLookup = az ad app list --display-name "Chargeback APIM Gateway" --query "[0].appId" -o tsv 2>$null
+    if (-not [string]::IsNullOrWhiteSpace($gwLookup)) { $gatewayAppId = $gwLookup }
+}
 if (-not [string]::IsNullOrWhiteSpace($gatewayAppId)) {
     $gwUris = @(az ad app show --id $gatewayAppId --query "identifierUris[]" -o tsv)
     if ($gwUris -notcontains "api://$gatewayAppId") {
@@ -193,7 +198,7 @@ foreach ($role in @(@{id=$adminRoleId; name='Chargeback.Admin'}, @{id=$exportRol
 Write-Host ""
 Write-Host "  Step 2: Writing dashboard auth config..." -ForegroundColor Yellow
 
-$uiEnvDir = Join-Path $RepoRoot "src\chargeback-ui"
+$uiEnvDir = Join-Path $RepoRoot "src\aipolicyengine-ui"
 $uiEnvFile = Join-Path $uiEnvDir ".env.production.local"
 $uiEnvContent = @(
     "VITE_AZURE_TENANT_ID=$tenantId"

@@ -21,8 +21,8 @@ Complete guide for deploying the Azure AI Gateway Policy Engine to Azure.
 ## Quick Deploy (Automated)
 
 ```powershell
-git clone https://github.com/your-org/apim-openai-chargeback-environment.git
-cd apim-openai-chargeback-environment
+git clone https://github.com/your-org/ai-policy-engine.git
+cd ai-policy-engine
 ./scripts/setup-azure.ps1 -Location eastus2 -WorkloadName myproject
 ```
 
@@ -48,44 +48,49 @@ For users who want to deploy step-by-step or need to customize the process.
 
 ```bash
 az login
-az group create --name rg-chargeback --location eastus2
+az group create --name rg-aipolicyengine --location eastus2
 ```
 
 ### 2. Create ACR and Build Docker Image
 
 ```bash
 # Create Azure Container Registry
-az acr create --resource-group rg-chargeback --name acrchargeback --sku Basic --admin-enabled true
+az acr create --resource-group rg-aipolicyengine --name acraipolicyengine --sku Basic --admin-enabled true
 
 # Login to ACR
-az acr login --name acrchargeback
+az acr login --name acraipolicyengine
 
 # Build and push the Docker image from the dotnet/ directory
 cd src
-docker build -t acrchargeback.azurecr.io/chargeback-api:latest .
-docker push acrchargeback.azurecr.io/chargeback-api:latest
+docker build -t acraipolicyengine.azurecr.io/aipolicyengine-api:latest .
+docker push acraipolicyengine.azurecr.io/aipolicyengine-api:latest
 cd ..
 ```
 
 ### 3. Register Entra ID Apps
 
-You need two app registrations: one for the **API** (audience) and one or more **client apps**.
+You need four app registrations (see `scripts/setup-azure.ps1` for the automated path):
 
-#### 3a. API App Registration (Audience)
+1. **AI Policy Engine API** — audience for dashboard UI calls direct to the Container App and APIM → Container App (MI) calls. Hosts `Chargeback.Export`, `Chargeback.Admin`, `Chargeback.Apim` app roles. Exposes `access_as_user` for the dashboard UI.
+2. **Chargeback APIM Gateway** — audience for client → APIM tokens (`ExpectedAudience`). Exposes `access_as_user`. Clients request `api://{gatewayAppId}/.default` (or `/access_as_user` for interactive flows).
+3. **Chargeback Sample Client** — internal demo client with `access_as_user` delegated permission on the Gateway app, and the `Chargeback.Admin` app-role on the API app (used for client-credentials plan seeding).
+4. **Chargeback Demo Client 2** *(optional)* — external/multi-tenant demo client with `access_as_user` delegated permission on the Gateway app.
+
+#### 3a. API App Registration (Container App audience)
 
 ```bash
 # Create the API app
 az ad app create \
-  --display-name "Chargeback API" \
-  --identifier-uris "api://chargeback-api" \
+  --display-name "AI Policy Engine API" \
+  --identifier-uris "api://aipolicyengine-api" \
   --sign-in-audience "AzureADMyOrg"
 
 # Note the appId from the output — this is your ExpectedAudience
-API_APP_ID=$(az ad app list --display-name "Chargeback API" --query "[0].appId" -o tsv)
+API_APP_ID=$(az ad app list --display-name "AIPolicyEngine API" --query "[0].appId" -o tsv)
 
 # Expose an API scope
 az ad app update --id $API_APP_ID \
-  --set "api.oauth2PermissionScopes=[{\"id\":\"$(uuidgen)\",\"adminConsentDescription\":\"Access Chargeback API\",\"adminConsentDisplayName\":\"access_as_user\",\"isEnabled\":true,\"type\":\"User\",\"userConsentDescription\":\"Access Chargeback API\",\"userConsentDisplayName\":\"access_as_user\",\"value\":\"access_as_user\"}]"
+  --set "api.oauth2PermissionScopes=[{\"id\":\"$(uuidgen)\",\"adminConsentDescription\":\"Access AIPolicyEngine API\",\"adminConsentDisplayName\":\"access_as_user\",\"isEnabled\":true,\"type\":\"User\",\"userConsentDescription\":\"Access AIPolicyEngine API\",\"userConsentDisplayName\":\"access_as_user\",\"value\":\"access_as_user\"}]"
 ```
 
 #### 3b. Client App Registration
@@ -180,7 +185,10 @@ az apim nv create --resource-group rg-chargeback --service-name $APIM_NAME \
   --named-value-id EntraTenantId --display-name EntraTenantId --value $TENANT_ID
 
 az apim nv create --resource-group rg-chargeback --service-name $APIM_NAME \
-  --named-value-id ExpectedAudience --display-name ExpectedAudience --value "api://chargeback-api"
+  --named-value-id ExpectedAudience --display-name ExpectedAudience --value "api://<gateway-app-id>"
+
+az apim nv create --resource-group rg-chargeback --service-name $APIM_NAME \
+  --named-value-id ContainerAppAudience --display-name ContainerAppAudience --value "api://<api-app-id>"
 
 az apim nv create --resource-group rg-chargeback --service-name $APIM_NAME \
   --named-value-id ContainerAppUrl --display-name ContainerAppUrl --value $CONTAINER_APP_URL
@@ -268,7 +276,7 @@ curl -X PUT "$CONTAINER_APP_URL/api/clients" \
 curl "$CONTAINER_APP_URL/api/usage"
 
 # Test through APIM with a token
-TOKEN=$(az account get-access-token --resource api://chargeback-api --query accessToken -o tsv)
+TOKEN=$(az account get-access-token --resource api://<gateway-app-id> --query accessToken -o tsv)
 curl -X POST "https://$APIM_NAME.azure-api.net/openai/deployments/gpt-4o/chat/completions" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
@@ -277,7 +285,7 @@ curl -X POST "https://$APIM_NAME.azure-api.net/openai/deployments/gpt-4o/chat/co
 # Configure DemoClient secrets
 dotnet user-secrets --project DemoClient init
 dotnet user-secrets --project DemoClient set "DemoClient:TenantId" "<tenant-id>"
-dotnet user-secrets --project DemoClient set "DemoClient:ApiScope" "api://<api-app-id>/.default"
+dotnet user-secrets --project DemoClient set "DemoClient:ApiScope" "api://<gateway-app-id>/.default"
 dotnet user-secrets --project DemoClient set "DemoClient:ApimBase" "https://$APIM_NAME.azure-api.net"
 dotnet user-secrets --project DemoClient set "DemoClient:ApiVersion" "2024-02-01"
 dotnet user-secrets --project DemoClient set "DemoClient:ChargebackBase" "$CONTAINER_APP_URL"

@@ -37,7 +37,8 @@ param(
     [switch]$SkipBicep,
     [switch]$SkipDocker,
     [bool]$EnableJwt = $true,
-    [bool]$EnableKeys = $true
+    [bool]$EnableKeys = $true,
+    [bool]$IncludeExternalDemoClient = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -519,6 +520,70 @@ try {
     $deploymentOutput["apiObjId"] = $apiObjId
     $deploymentOutput["adminRoleId"] = $adminRoleId
 
+    # --- Gateway App (NEW — APIM JWT audience for client→APIM tokens) ---
+    Write-Host "  Creating gateway app 'Chargeback APIM Gateway'..." -ForegroundColor Gray
+
+    $existingGatewayApp = az ad app list --display-name "Chargeback APIM Gateway" --query "[0]" 2>$null | ConvertFrom-Json
+    if ($existingGatewayApp) {
+        $gatewayAppId = $existingGatewayApp.appId
+        $gatewayObjId = $existingGatewayApp.id
+        Write-Host "    ✓ Reusing existing gateway app: $gatewayAppId" -ForegroundColor Green
+    } else {
+        $gatewayApp = az ad app create --display-name "Chargeback APIM Gateway" --sign-in-audience AzureADMultipleOrgs | ConvertFrom-Json
+        $gatewayAppId = $gatewayApp.appId
+        $gatewayObjId = $gatewayApp.id
+        Write-Host "    ✓ Gateway app created (multi-tenant): $gatewayAppId" -ForegroundColor Green
+    }
+
+    # Ensure multi-tenant (required so external clients in other tenants can consent)
+    az ad app update --id $gatewayAppId --sign-in-audience AzureADMultipleOrgs 2>$null
+
+    # Ensure Microsoft Graph openid permission on the gateway app (for third-party tenant consent)
+    Write-Host "  Ensuring Microsoft Graph openid permission on gateway app..." -ForegroundColor Gray
+    $gwGraphAccess = az ad app show --id $gatewayAppId --query "requiredResourceAccess[?resourceAppId=='00000003-0000-0000-c000-000000000000'].resourceAccess[].id" -o tsv 2>$null
+    if (($gwGraphAccess -split "`n" | ForEach-Object { $_.Trim() }) -notcontains $graphOpenIdId) {
+        az ad app permission add --id $gatewayAppId --api 00000003-0000-0000-c000-000000000000 --api-permissions "$graphOpenIdId=Scope" -o none 2>$null
+    }
+    Write-Host "    ✓ Graph openid permission configured on gateway app" -ForegroundColor Green
+
+    # Identifier URI
+    az ad app update --id $gatewayAppId --identifier-uris "api://$gatewayAppId"
+    if ($LASTEXITCODE -ne 0) { throw "Failed to set gateway app identifier URI." }
+    Write-Host "    ✓ Gateway identifier URI set: api://$gatewayAppId" -ForegroundColor Green
+
+    # Expose access_as_user OAuth2 scope on the gateway (this is what APIM validates `aud` against)
+    $gatewayScopeId = az ad app show --id $gatewayAppId --query "api.oauth2PermissionScopes[?value=='access_as_user'] | [0].id" -o tsv 2>$null
+    if ([string]::IsNullOrWhiteSpace($gatewayScopeId)) {
+        $gatewayScopeId = [guid]::NewGuid().ToString()
+        $scopeBody = @{
+            api = @{
+                oauth2PermissionScopes = @(@{
+                    id                       = $gatewayScopeId
+                    adminConsentDisplayName  = "Access OpenAI via APIM Gateway"
+                    adminConsentDescription  = "Allows the app to call Azure OpenAI endpoints through the APIM chargeback gateway"
+                    type                     = "Admin"
+                    value                    = "access_as_user"
+                    isEnabled                = $true
+                })
+            }
+        } | ConvertTo-Json -Depth 5 -Compress
+
+        $scopeFile = Join-Path $env:TEMP "gateway-scope-body.json"
+        [System.IO.File]::WriteAllText($scopeFile, $scopeBody, [System.Text.UTF8Encoding]::new($false))
+        az rest --method PATCH --uri "https://graph.microsoft.com/v1.0/applications/$gatewayObjId" --headers "Content-Type=application/json" --body "@$scopeFile" -o none
+        Remove-Item $scopeFile -ErrorAction SilentlyContinue
+        if ($LASTEXITCODE -ne 0) { throw "Failed to expose gateway 'access_as_user' scope." }
+        Write-Host "    ✓ Gateway scope 'access_as_user' exposed" -ForegroundColor Green
+    } else {
+        Write-Host "    ✓ Gateway scope 'access_as_user' already present" -ForegroundColor Green
+    }
+
+    Write-Host "  Ensuring gateway enterprise application exists..." -ForegroundColor Gray
+    Ensure-ServicePrincipal -AppId $gatewayAppId -DisplayName "Chargeback APIM Gateway"
+
+    $deploymentOutput["gatewayAppId"] = $gatewayAppId
+    $deploymentOutput["gatewayObjId"] = $gatewayObjId
+
     # --- Client App 1 ---
     Write-Host "  Creating client app 'Chargeback Sample Client'..." -ForegroundColor Gray
 
@@ -535,7 +600,7 @@ try {
     }
 
     Ensure-ServicePrincipal -AppId $client1AppId -DisplayName "Chargeback Sample Client"
-    Ensure-DelegatedScopeAndConsent -ClientAppId $client1AppId -ApiAppId $apiAppId -ScopeId $scopeId -ClientDisplayName "Chargeback Sample Client"
+    Ensure-DelegatedScopeAndConsent -ClientAppId $client1AppId -ApiAppId $gatewayAppId -ScopeId $gatewayScopeId -ClientDisplayName "Chargeback Sample Client"
 
     # Add Microsoft Graph openid permission to Client 1
     $client1GraphAccess = az ad app show --id $client1AppId --query "requiredResourceAccess[?resourceAppId=='00000003-0000-0000-c000-000000000000'].resourceAccess[].id" -o tsv 2>$null
@@ -574,6 +639,16 @@ try {
     $deploymentOutput["client1Secret"] = $client1Secret
 
     # --- Client App 2 (Multi-tenant — demonstrates per-tenant billing) ---
+    # Optional: skip via -IncludeExternalDemoClient:$false
+    if (-not $IncludeExternalDemoClient) {
+        Write-Host "  ⊘ Skipping Client 2 creation (-IncludeExternalDemoClient:`$false)" -ForegroundColor DarkGray
+        $client2AppId = ""
+        $client2ObjId = ""
+        $client2Secret = ""
+        $deploymentOutput["client2AppId"] = ""
+        $deploymentOutput["client2ObjId"] = ""
+        $deploymentOutput["client2Secret"] = ""
+    } else {
     Write-Host "  Creating client app 'Chargeback Demo Client 2' (multi-tenant)..." -ForegroundColor Gray
 
     $existingClient2 = az ad app list --display-name "Chargeback Demo Client 2" --query "[0]" 2>$null | ConvertFrom-Json
@@ -592,7 +667,7 @@ try {
     }
 
     Ensure-ServicePrincipal -AppId $client2AppId -DisplayName "Chargeback Demo Client 2"
-    Ensure-DelegatedScopeAndConsent -ClientAppId $client2AppId -ApiAppId $apiAppId -ScopeId $scopeId -ClientDisplayName "Chargeback Demo Client 2"
+    Ensure-DelegatedScopeAndConsent -ClientAppId $client2AppId -ApiAppId $gatewayAppId -ScopeId $gatewayScopeId -ClientDisplayName "Chargeback Demo Client 2"
 
     # Add Microsoft Graph openid permission to Client 2
     $client2GraphAccess = az ad app show --id $client2AppId --query "requiredResourceAccess[?resourceAppId=='00000003-0000-0000-c000-000000000000'].resourceAccess[].id" -o tsv 2>$null
@@ -613,6 +688,7 @@ try {
     $deploymentOutput["client2AppId"] = $client2AppId
     $deploymentOutput["client2ObjId"] = $client2ObjId
     $deploymentOutput["client2Secret"] = $client2Secret
+    }
 
     Write-Host "  Phase 3 complete ✓" -ForegroundColor Green
     Write-Host ""
@@ -639,7 +715,7 @@ if ($SkipDocker) {
 } else {
     try {
         Write-Host "  Writing dashboard auth config for UI build..." -ForegroundColor Gray
-        $uiEnvFile = Join-Path $RepoRoot "src\chargeback-ui\.env.production.local"
+        $uiEnvFile = Join-Path $RepoRoot "src\aipolicyengine-ui\.env.production.local"
         $uiEnvLines = @(
             "# Auto-generated by scripts/setup-azure.ps1"
             "VITE_AZURE_CLIENT_ID=$apiAppId"
@@ -979,8 +1055,8 @@ try {
     Write-Host "    ✓ EntraTenantId" -ForegroundColor Green
 
     az apim nv create --resource-group $ResourceGroupName --service-name $ApimName `
-        --named-value-id ExpectedAudience --display-name "ExpectedAudience" --value "api://$apiAppId" -o none 2>$null
-    Write-Host "    ✓ ExpectedAudience = api://$apiAppId" -ForegroundColor Green
+        --named-value-id ExpectedAudience --display-name "ExpectedAudience" --value "api://$gatewayAppId" -o none 2>$null
+    Write-Host "    ✓ ExpectedAudience = api://$gatewayAppId" -ForegroundColor Green
 
     az apim nv create --resource-group $ResourceGroupName --service-name $ApimName `
         --named-value-id ContainerAppUrl --display-name "ContainerAppUrl" --value "https://$containerAppUrl" -o none 2>$null
@@ -1214,24 +1290,29 @@ try {
     Invoke-RestMethod -Uri "$baseUrl/api/clients/$client1AppId/$tenantId" -Method Put -Body $client1Body -ContentType "application/json" -Headers $authHeaders | Out-Null
     Write-Host "    ✓ Client 1 → Enterprise plan (tenant: $tenantId)" -ForegroundColor Green
 
-    # Client 2 is multi-tenant — register with the deployment tenant first
-    $client2Body = @{ planId = $startPlan.id; displayName = "Chargeback Demo Client 2" } | ConvertTo-Json
-    Invoke-RestMethod -Uri "$baseUrl/api/clients/$client2AppId/$tenantId" -Method Put -Body $client2Body -ContentType "application/json" -Headers $authHeaders | Out-Null
-    Write-Host "    ✓ Client 2 → Starter plan (tenant: $tenantId)" -ForegroundColor Green
+    # Client 2 is multi-tenant — register with the deployment tenant first (optional)
+    if ($IncludeExternalDemoClient -and -not [string]::IsNullOrWhiteSpace($client2AppId)) {
+        $client2Body = @{ planId = $startPlan.id; displayName = "Chargeback Demo Client 2" } | ConvertTo-Json
+        Invoke-RestMethod -Uri "$baseUrl/api/clients/$client2AppId/$tenantId" -Method Put -Body $client2Body -ContentType "application/json" -Headers $authHeaders | Out-Null
+        Write-Host "    ✓ Client 2 → Starter plan (tenant: $tenantId)" -ForegroundColor Green
 
-    # If a secondary tenant ID is provided, also register Client 2 for that tenant
-    if (-not [string]::IsNullOrWhiteSpace($SecondaryTenantId)) {
-        # Provision service principals in the secondary tenant
-        Write-Host "  Provisioning service principals in secondary tenant $SecondaryTenantId..." -ForegroundColor Gray
-        Write-Host "    ⚠ You must run the following commands while logged into the secondary tenant:" -ForegroundColor DarkYellow
-        Write-Host "      az login --tenant $SecondaryTenantId" -ForegroundColor Yellow
-        Write-Host "      az ad sp create --id $apiAppId" -ForegroundColor Yellow
-        Write-Host "      az ad sp create --id $client2AppId" -ForegroundColor Yellow
-        Write-Host "      az login --tenant $tenantId   # switch back" -ForegroundColor Yellow
+        # If a secondary tenant ID is provided, also register Client 2 for that tenant
+        if (-not [string]::IsNullOrWhiteSpace($SecondaryTenantId)) {
+            # Provision service principals in the secondary tenant
+            Write-Host "  Provisioning service principals in secondary tenant $SecondaryTenantId..." -ForegroundColor Gray
+            Write-Host "    ⚠ You must run the following commands while logged into the secondary tenant:" -ForegroundColor DarkYellow
+            Write-Host "      az login --tenant $SecondaryTenantId" -ForegroundColor Yellow
+            Write-Host "      az ad sp create --id $apiAppId" -ForegroundColor Yellow
+            Write-Host "      az ad sp create --id $gatewayAppId" -ForegroundColor Yellow
+            Write-Host "      az ad sp create --id $client2AppId" -ForegroundColor Yellow
+            Write-Host "      az login --tenant $tenantId   # switch back" -ForegroundColor Yellow
 
-        $client2SecondaryBody = @{ planId = $startPlan.id; displayName = "Chargeback Demo Client 2 (Secondary Tenant)" } | ConvertTo-Json
-        Invoke-RestMethod -Uri "$baseUrl/api/clients/$client2AppId/$SecondaryTenantId" -Method Put -Body $client2SecondaryBody -ContentType "application/json" -Headers $authHeaders | Out-Null
-        Write-Host "    ✓ Client 2 → Starter plan (secondary tenant: $SecondaryTenantId)" -ForegroundColor Green
+            $client2SecondaryBody = @{ planId = $startPlan.id; displayName = "Chargeback Demo Client 2 (Secondary Tenant)" } | ConvertTo-Json
+            Invoke-RestMethod -Uri "$baseUrl/api/clients/$client2AppId/$SecondaryTenantId" -Method Put -Body $client2SecondaryBody -ContentType "application/json" -Headers $authHeaders | Out-Null
+            Write-Host "    ✓ Client 2 → Starter plan (secondary tenant: $SecondaryTenantId)" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "    ⊘ Skipping Client 2 plan registration (-IncludeExternalDemoClient:`$false)" -ForegroundColor DarkGray
     }
 
     $deploymentOutput["enterprisePlanId"] = $entPlan.id
@@ -1257,7 +1338,7 @@ $client2SecretForEnv = if ([string]::IsNullOrWhiteSpace($client2Secret)) { "<cli
 $demoClientEnv = [ordered]@{
     "DemoClient__TenantId"                 = $tenantId
     "DemoClient__SecondaryTenantId"        = if ([string]::IsNullOrWhiteSpace($SecondaryTenantId)) { "" } else { $SecondaryTenantId }
-    "DemoClient__ApiScope"                 = "api://$apiAppId/.default"
+    "DemoClient__ApiScope"                 = "api://$gatewayAppId/.default"
     "DemoClient__ApimBase"                 = "https://$($ApimName).azure-api.net"
     "DemoClient__ApiVersion"               = "2024-02-01"
     "DemoClient__ChargebackBase"           = "https://$containerAppUrl"
@@ -1267,12 +1348,14 @@ $demoClientEnv = [ordered]@{
     "DemoClient__Clients__0__Plan"         = "Enterprise"
     "DemoClient__Clients__0__DeploymentId" = "gpt-4o"
     "DemoClient__Clients__0__TenantId"     = $tenantId
-    "DemoClient__Clients__1__Name"         = "Chargeback Demo Client 2"
-    "DemoClient__Clients__1__AppId"        = $client2AppId
-    "DemoClient__Clients__1__Secret"       = $client2SecretForEnv
-    "DemoClient__Clients__1__Plan"         = "Starter"
-    "DemoClient__Clients__1__DeploymentId" = "gpt-4o-mini"
-    "DemoClient__Clients__1__TenantId"     = $tenantId
+}
+if ($IncludeExternalDemoClient -and -not [string]::IsNullOrWhiteSpace($client2AppId)) {
+    $demoClientEnv["DemoClient__Clients__1__Name"]         = "Chargeback Demo Client 2"
+    $demoClientEnv["DemoClient__Clients__1__AppId"]        = $client2AppId
+    $demoClientEnv["DemoClient__Clients__1__Secret"]       = $client2SecretForEnv
+    $demoClientEnv["DemoClient__Clients__1__Plan"]         = "Starter"
+    $demoClientEnv["DemoClient__Clients__1__DeploymentId"] = "gpt-4o-mini"
+    $demoClientEnv["DemoClient__Clients__1__TenantId"]     = $tenantId
 }
 foreach ($entry in $demoClientEnv.GetEnumerator()) {
     Set-Item -Path "Env:$($entry.Key)" -Value ([string]$entry.Value)
@@ -1319,15 +1402,25 @@ if ($deploymentOutput["logAnalyticsWorkbookUrl"]) {
 Write-Host ""
 Write-Host "  ── Entra App Registrations ──" -ForegroundColor Cyan
 Write-Host "  API App ID:        $apiAppId"
-Write-Host "  API Audience:      api://$apiAppId"
+Write-Host "  API Audience:      api://$apiAppId   (dashboard UI → Container App, plan seeding)"
+Write-Host "  Gateway App ID:    $gatewayAppId"
+Write-Host "  Gateway Audience:  api://$gatewayAppId   (client → APIM — used by demo DemoClient__ApiScope)"
 Write-Host "  Client 1 App ID:   $client1AppId"
 if ($client1Secret) {
     Write-Host "  Client 1 Secret:   $client1Secret" -ForegroundColor DarkYellow
 }
-Write-Host "  Client 2 App ID:   $client2AppId"
-if ($client2Secret) {
-    Write-Host "  Client 2 Secret:   $client2Secret" -ForegroundColor DarkYellow
+if ($IncludeExternalDemoClient -and -not [string]::IsNullOrWhiteSpace($client2AppId)) {
+    Write-Host "  Client 2 App ID:   $client2AppId"
+    if ($client2Secret) {
+        Write-Host "  Client 2 Secret:   $client2Secret" -ForegroundColor DarkYellow
+    }
+} else {
+    Write-Host "  Client 2:          (skipped — -IncludeExternalDemoClient:`$false)" -ForegroundColor DarkGray
 }
+Write-Host ""
+Write-Host "  ⚠ Token audience changed: clients going through APIM must request" -ForegroundColor DarkYellow
+Write-Host "    api://$gatewayAppId/.default. Cached tokens targeting the old API" -ForegroundColor DarkYellow
+Write-Host "    audience will receive 401 from APIM until refreshed." -ForegroundColor DarkYellow
 Write-Host ""
 if ($deploymentOutput["dashboardUiEnvFile"]) {
     Write-Host "  ── Dashboard UI Auth Config ──" -ForegroundColor Cyan

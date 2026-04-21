@@ -17,6 +17,7 @@
 #       --skip-build                   Skip ACR image build
 #       --no-jwt                       Disable JWT-authenticated OpenAI API endpoint
 #       --no-keys                      Disable subscription-key-authenticated OpenAI API endpoint
+#       --no-external-demo-client      Skip the optional 'Chargeback Demo Client 2' external demo app
 #   -h, --help                         Show this help
 
 set -uo pipefail
@@ -53,6 +54,7 @@ SKIP_BICEP=false
 SKIP_BUILD=false
 ENABLE_JWT=true
 ENABLE_KEYS=true
+INCLUDE_EXTERNAL_DEMO_CLIENT=true
 
 usage() {
     sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# //' | sed 's/^#//'
@@ -69,6 +71,7 @@ while [[ $# -gt 0 ]]; do
         --skip-build)            SKIP_BUILD=true;             shift   ;;
         --no-jwt)                ENABLE_JWT=false;            shift   ;;
         --no-keys)               ENABLE_KEYS=false;           shift   ;;
+        --no-external-demo-client) INCLUDE_EXTERNAL_DEMO_CLIENT=false; shift ;;
         -h|--help)               usage ;;
         *) die "Unknown option: $1" ;;
     esac
@@ -510,6 +513,68 @@ else
     warn "Could not determine current user — assign roles manually in Entra ID"
 fi
 
+# ── Gateway App (APIM JWT audience) ──
+info "Creating gateway app 'Chargeback APIM Gateway' (multi-tenant)..."
+existing_gateway=$(az ad app list --display-name "Chargeback APIM Gateway" --query "[0]" -o json 2>/dev/null) || true
+if [[ -n "$existing_gateway" && "$existing_gateway" != "null" ]]; then
+    gateway_app_id=$(echo "$existing_gateway" | jq -r '.appId')
+    gateway_obj_id=$(echo "$existing_gateway" | jq -r '.id')
+    success "Reusing existing gateway app: $gateway_app_id"
+    az ad app update --id "$gateway_app_id" --sign-in-audience AzureADMultipleOrgs 2>/dev/null || true
+else
+    gateway_json=$(az ad app create --display-name "Chargeback APIM Gateway" --sign-in-audience AzureADMultipleOrgs -o json) \
+        || die "Failed to create gateway app."
+    gateway_app_id=$(echo "$gateway_json" | jq -r '.appId')
+    gateway_obj_id=$(echo "$gateway_json" | jq -r '.id')
+    success "Gateway app created (multi-tenant): $gateway_app_id"
+fi
+
+# Set Application ID URI on gateway
+az ad app update --id "$gateway_app_id" --identifier-uris "api://$gateway_app_id" \
+    || die "Failed to set gateway identifier URI."
+success "Gateway identifier URI set: api://$gateway_app_id"
+
+# Graph openid permission on gateway
+gateway_graph=$(az ad app show --id "$gateway_app_id" \
+    --query "requiredResourceAccess[?resourceAppId=='00000003-0000-0000-c000-000000000000'].resourceAccess[].id" \
+    -o tsv 2>/dev/null) || true
+if ! echo "$gateway_graph" | grep -qx "$graph_openid_id"; then
+    az ad app permission add --id "$gateway_app_id" \
+        --api 00000003-0000-0000-c000-000000000000 \
+        --api-permissions "${graph_openid_id}=Scope" -o none 2>/dev/null || true
+fi
+
+# Expose 'access_as_user' scope on gateway
+gateway_scope_id=$(az ad app show --id "$gateway_app_id" \
+    --query "api.oauth2PermissionScopes[?value=='access_as_user'] | [0].id" -o tsv 2>/dev/null) || true
+if [[ -z "$gateway_scope_id" ]]; then
+    gateway_scope_id=$(uuidgen | tr '[:upper:]' '[:lower:]')
+    gateway_scope_body=$(jq -n --arg id "$gateway_scope_id" '{
+        api: {
+            oauth2PermissionScopes: [{
+                id: $id,
+                adminConsentDisplayName: "Access Chargeback APIM Gateway",
+                adminConsentDescription: "Allows the app to call the Chargeback APIM gateway",
+                type: "Admin",
+                value: "access_as_user",
+                isEnabled: true
+            }]
+        }
+    }')
+    tmp_gscope=$(mktemp)
+    echo "$gateway_scope_body" > "$tmp_gscope"
+    az rest --method PATCH \
+        --uri "https://graph.microsoft.com/v1.0/applications/$gateway_obj_id" \
+        --headers "Content-Type=application/json" --body "@$tmp_gscope" -o none \
+        || { rm -f "$tmp_gscope"; die "Failed to expose gateway scope."; }
+    rm -f "$tmp_gscope"
+    success "Gateway scope 'access_as_user' exposed"
+else
+    success "Gateway scope 'access_as_user' already present"
+fi
+
+ensure_service_principal "$gateway_app_id" "Chargeback APIM Gateway"
+
 # ── Client App 1 ──
 info "Creating client app 'Chargeback Sample Client'..."
 existing_client1=$(az ad app list --display-name "Chargeback Sample Client" --query "[0]" -o json 2>/dev/null) || true
@@ -526,7 +591,7 @@ else
 fi
 
 ensure_service_principal "$client1_app_id" "Chargeback Sample Client"
-ensure_delegated_scope_and_consent "$client1_app_id" "$api_app_id" "$scope_id" "Chargeback Sample Client"
+ensure_delegated_scope_and_consent "$client1_app_id" "$gateway_app_id" "$gateway_scope_id" "Chargeback Sample Client"
 
 # Graph openid for Client 1
 client1_graph=$(az ad app show --id "$client1_app_id" \
@@ -567,7 +632,13 @@ if [[ -n "$client1_sp_id" && -n "$api_sp_id" ]]; then
     fi
 fi
 
-# ── Client App 2 (multi-tenant) ──
+# ── Client App 2 (multi-tenant, optional) ──
+if [[ "$INCLUDE_EXTERNAL_DEMO_CLIENT" != "true" ]]; then
+    info "Skipping 'Chargeback Demo Client 2' creation (--no-external-demo-client)"
+    client2_app_id=""
+    client2_obj_id=""
+    client2_secret=""
+else
 info "Creating client app 'Chargeback Demo Client 2' (multi-tenant)..."
 existing_client2=$(az ad app list --display-name "Chargeback Demo Client 2" --query "[0]" -o json 2>/dev/null) || true
 if [[ -n "$existing_client2" && "$existing_client2" != "null" ]]; then
@@ -585,7 +656,7 @@ else
 fi
 
 ensure_service_principal "$client2_app_id" "Chargeback Demo Client 2"
-ensure_delegated_scope_and_consent "$client2_app_id" "$api_app_id" "$scope_id" "Chargeback Demo Client 2"
+ensure_delegated_scope_and_consent "$client2_app_id" "$gateway_app_id" "$gateway_scope_id" "Chargeback Demo Client 2"
 
 # Graph openid for Client 2
 client2_graph=$(az ad app show --id "$client2_app_id" \
@@ -607,6 +678,7 @@ success "Client 2 public client redirect URI configured (http://localhost:29783)
 client2_secret=$(az ad app credential reset --id "$client2_app_id" \
     --display-name "setup-script" --years 1 --query "password" -o tsv 2>/dev/null) || true
 [[ -n "$client2_secret" ]] && success "Client 2 secret created"
+fi
 
 echo -e "  ${GREEN}Phase 3 complete ✓${NC}"
 echo ""
@@ -637,7 +709,7 @@ if [[ "$SKIP_BUILD" == "true" ]]; then
     echo ""
 else
     info "Writing dashboard auth config for UI build..."
-    ui_env_file="$REPO_ROOT/src/chargeback-ui/.env.production.local"
+    ui_env_file="$REPO_ROOT/src/aipolicyengine-ui/.env.production.local"
     cat > "$ui_env_file" <<EOF
 # Auto-generated by scripts/setup-azure.sh
 VITE_AZURE_CLIENT_ID=$api_app_id
@@ -912,8 +984,8 @@ az apim nv create --resource-group "$RESOURCE_GROUP_NAME" --service-name "$APIM_
 success "EntraTenantId"
 
 az apim nv create --resource-group "$RESOURCE_GROUP_NAME" --service-name "$APIM_NAME" \
-    --named-value-id ExpectedAudience --display-name "ExpectedAudience" --value "api://$api_app_id" -o none 2>/dev/null || true
-success "ExpectedAudience = api://$api_app_id"
+    --named-value-id ExpectedAudience --display-name "ExpectedAudience" --value "api://$gateway_app_id" -o none 2>/dev/null || true
+success "ExpectedAudience = api://$gateway_app_id"
 
 az apim nv create --resource-group "$RESOURCE_GROUP_NAME" --service-name "$APIM_NAME" \
     --named-value-id ContainerAppUrl --display-name "ContainerAppUrl" --value "https://$container_app_url" -o none 2>/dev/null || true
@@ -1124,25 +1196,30 @@ phase9_failed=false
         "$base_url/api/clients/$client1_app_id/$tenant_id" -o /dev/null --max-time 15
     success "Client 1 → Enterprise plan (tenant: $tenant_id)"
 
-    client2_body=$(jq -n --arg pid "$start_plan_id" '{planId:$pid,displayName:"Chargeback Demo Client 2"}')
-    curl -sf -X PUT -H "Authorization: Bearer $access_token" \
-        -H "Content-Type: application/json" -d "$client2_body" \
-        "$base_url/api/clients/$client2_app_id/$tenant_id" -o /dev/null --max-time 15
-    success "Client 2 → Starter plan (tenant: $tenant_id)"
-
-    if [[ -n "$SECONDARY_TENANT_ID" ]]; then
-        info "Provisioning service principals in secondary tenant $SECONDARY_TENANT_ID..."
-        warn "You must run the following commands while logged into the secondary tenant:"
-        echo -e "  ${YELLOW}    az login --tenant $SECONDARY_TENANT_ID${NC}"
-        echo -e "  ${YELLOW}    az ad sp create --id $api_app_id${NC}"
-        echo -e "  ${YELLOW}    az ad sp create --id $client2_app_id${NC}"
-        echo -e "  ${YELLOW}    az login --tenant $tenant_id   # switch back${NC}"
-
-        client2_sec_body=$(jq -n --arg pid "$start_plan_id" '{planId:$pid,displayName:"Chargeback Demo Client 2 (Secondary Tenant)"}')
+    if [[ "$INCLUDE_EXTERNAL_DEMO_CLIENT" == "true" && -n "$client2_app_id" ]]; then
+        client2_body=$(jq -n --arg pid "$start_plan_id" '{planId:$pid,displayName:"Chargeback Demo Client 2"}')
         curl -sf -X PUT -H "Authorization: Bearer $access_token" \
-            -H "Content-Type: application/json" -d "$client2_sec_body" \
-            "$base_url/api/clients/$client2_app_id/$SECONDARY_TENANT_ID" -o /dev/null --max-time 15
-        success "Client 2 → Starter plan (secondary tenant: $SECONDARY_TENANT_ID)"
+            -H "Content-Type: application/json" -d "$client2_body" \
+            "$base_url/api/clients/$client2_app_id/$tenant_id" -o /dev/null --max-time 15
+        success "Client 2 → Starter plan (tenant: $tenant_id)"
+
+        if [[ -n "$SECONDARY_TENANT_ID" ]]; then
+            info "Provisioning service principals in secondary tenant $SECONDARY_TENANT_ID..."
+            warn "You must run the following commands while logged into the secondary tenant:"
+            echo -e "  ${YELLOW}    az login --tenant $SECONDARY_TENANT_ID${NC}"
+            echo -e "  ${YELLOW}    az ad sp create --id $api_app_id${NC}"
+            echo -e "  ${YELLOW}    az ad sp create --id $gateway_app_id${NC}"
+            echo -e "  ${YELLOW}    az ad sp create --id $client2_app_id${NC}"
+            echo -e "  ${YELLOW}    az login --tenant $tenant_id   # switch back${NC}"
+
+            client2_sec_body=$(jq -n --arg pid "$start_plan_id" '{planId:$pid,displayName:"Chargeback Demo Client 2 (Secondary Tenant)"}')
+            curl -sf -X PUT -H "Authorization: Bearer $access_token" \
+                -H "Content-Type: application/json" -d "$client2_sec_body" \
+                "$base_url/api/clients/$client2_app_id/$SECONDARY_TENANT_ID" -o /dev/null --max-time 15
+            success "Client 2 → Starter plan (secondary tenant: $SECONDARY_TENANT_ID)"
+        fi
+    else
+        info "Skipping Client 2 plan registration (--no-external-demo-client)"
     fi
 
     # Write plan IDs to temp files so the parent shell can pick them up
@@ -1185,7 +1262,7 @@ cat > "$demo_env_file" <<EOF
 # Update deployment IDs if your Azure OpenAI deployment names differ.
 DemoClient__TenantId=$tenant_id
 DemoClient__SecondaryTenantId=${SECONDARY_TENANT_ID}
-DemoClient__ApiScope=api://$api_app_id/.default
+DemoClient__ApiScope=api://$gateway_app_id/.default
 DemoClient__ApimBase=https://${APIM_NAME}.azure-api.net/jwt
 DemoClient__ApiVersion=2024-02-01
 DemoClient__ChargebackBase=https://$container_app_url
@@ -1195,12 +1272,20 @@ DemoClient__Clients__0__Secret=$client1_secret_env
 DemoClient__Clients__0__Plan=Enterprise
 DemoClient__Clients__0__DeploymentId=gpt-4o
 DemoClient__Clients__0__TenantId=$tenant_id
+EOF
+
+if [[ "$INCLUDE_EXTERNAL_DEMO_CLIENT" == "true" && -n "$client2_app_id" ]]; then
+    cat >> "$demo_env_file" <<EOF
 DemoClient__Clients__1__Name="Chargeback Demo Client 2"
 DemoClient__Clients__1__AppId=$client2_app_id
 DemoClient__Clients__1__Secret=$client2_secret_env
 DemoClient__Clients__1__Plan=Starter
 DemoClient__Clients__1__DeploymentId=gpt-4o-mini
 DemoClient__Clients__1__TenantId=$tenant_id
+EOF
+fi
+
+cat >> "$demo_env_file" <<EOF
 DemoClient__AgentInstructions="You are a concise Azure platform assistant. Keep responses to one sentence."
 DemoClient__Prompts__0="What is Azure API Management in one sentence?"
 DemoClient__Prompts__1="Explain token-based billing in one sentence."
@@ -1231,6 +1316,8 @@ jq -n \
     --arg demoClientEnvFile "$demo_env_file" \
     --arg apiAppId "$api_app_id" \
     --arg apiObjId "$api_obj_id" \
+    --arg gatewayAppId "$gateway_app_id" \
+    --arg gatewayObjId "$gateway_obj_id" \
     --arg adminRoleId "$admin_role_id" \
     --arg client1AppId "$client1_app_id" \
     --arg client1ObjId "$client1_obj_id" \
@@ -1270,11 +1357,21 @@ echo "  APIM Gateway:      https://${APIM_NAME}.azure-api.net"
 echo ""
 echo -e "  ${CYAN}── Entra App Registrations ──${NC}"
 echo "  API App ID:        $api_app_id"
-echo "  API Audience:      api://$api_app_id"
+echo "  API Audience:      api://$api_app_id   (dashboard UI → Container App, plan seeding)"
+echo "  Gateway App ID:    $gateway_app_id"
+echo "  Gateway Audience:  api://$gateway_app_id   (client → APIM — used by demo DemoClient__ApiScope)"
 echo "  Client 1 App ID:   $client1_app_id"
 [[ -n "${client1_secret:-}" ]] && echo -e "  Client 1 Secret:   ${DARKYELLOW}$client1_secret${NC}"
-echo "  Client 2 App ID:   $client2_app_id"
-[[ -n "${client2_secret:-}" ]] && echo -e "  Client 2 Secret:   ${DARKYELLOW}$client2_secret${NC}"
+if [[ "$INCLUDE_EXTERNAL_DEMO_CLIENT" == "true" && -n "$client2_app_id" ]]; then
+    echo "  Client 2 App ID:   $client2_app_id"
+    [[ -n "${client2_secret:-}" ]] && echo -e "  Client 2 Secret:   ${DARKYELLOW}$client2_secret${NC}"
+else
+    echo -e "  Client 2:          ${GRAY}(skipped — --no-external-demo-client)${NC}"
+fi
+echo ""
+echo -e "  ${DARKYELLOW}⚠ Token audience changed: clients going through APIM must request${NC}"
+echo -e "  ${DARKYELLOW}  api://$gateway_app_id/.default. Cached tokens targeting the old API${NC}"
+echo -e "  ${DARKYELLOW}  audience will receive 401 from APIM until refreshed.${NC}"
 echo ""
 if [[ -n "${ui_env_file:-}" ]]; then
     echo -e "  ${CYAN}── Dashboard UI Auth Config ──${NC}"
