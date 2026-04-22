@@ -761,7 +761,6 @@ if ($SkipBicep) {
         $bicepResult = az deployment group create `
             --resource-group $ResourceGroupName `
             --template-file "$RepoRoot/infra/bicep/main.bicep" `
-            --parameters "$RepoRoot/infra/bicep/parameter.json" `
             --parameters `
                 location=$Location `
                 workloadName=$WorkloadName `
